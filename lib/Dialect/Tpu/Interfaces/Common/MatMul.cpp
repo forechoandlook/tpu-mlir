@@ -33,8 +33,11 @@ matmul_attr_t tpu::MatMulOp::parseParam() {
   p.relu_limit = this->getReluLimit().convertToDouble();
   p.right_zp = getRightZp();
   p.right_transpose = getRightTranspose();
+  p.left_transpose = getLeftTranspose();
+  p.hdim_is_batch = getHdimIsBatch();
   auto b_dims = b_s.size();
   auto o_dims = o_s.size();
+  p.batch_low = 1;
   if (b_dims == 1) {
     assert(p.right_transpose == false);
     b_s.push_back(1);
@@ -42,18 +45,53 @@ matmul_attr_t tpu::MatMulOp::parseParam() {
     b_dims += 1;
     o_dims += 1;
   }
-  p.N = p.right_transpose ? b_s[b_dims - 2] : b_s[b_dims - 1];
-  assert(p.N == o_s[o_dims - 1]);
-  p.K = p.right_transpose ? b_s[b_dims - 1] : b_s[b_dims - 2];
-  p.batch = 1;
-  for (int i = 0; i < b_dims - 2; i++) {
-    p.batch *= b_s[i];
-  }
-  if (p.batch > 1 || o_dims <= 2) {
-    p.M = o_s[o_dims - 2];
+  // for hdim_is_batch = true,
+  // BM1684x: (B0, M, B1, K) x (B0, K, B1, N) = (B0, M, B1, N)
+  // CV18xx:  (B0, B1, M, K) x (B0, K, B1, N) = (B0, B1, M, N)
+  if (p.right_transpose) {
+    if (getHdimIsBatch()) {
+      // trans ch
+      if (module::isCV18xx()) {
+        p.K = b_s[b_dims - 3];
+        p.N = b_s[b_dims - 1];
+      } else {
+        p.K = b_s[b_dims - 1];
+        p.N = b_s[b_dims - 3];
+      }
+      p.batch_low = b_s[b_dims - 2];
+    } else {
+      // trans hw
+      p.N = b_s[b_dims - 2];
+      p.K = b_s[b_dims - 1];
+    }
   } else {
-    p.M = std::accumulate(o_s.begin(), o_s.begin() + o_dims - 1, 1,
-                          std::multiplies<int64_t>());
+    p.N = b_s[b_dims - 1];
+    p.K = b_s[b_dims - 2];
+  }
+  assert(p.N == o_s[o_dims - 1]);
+
+  if (!module::isCV18xx() && p.hdim_is_batch) {
+    p.M = o_s[o_dims - 3];
+    p.batch = o_s[0];
+  } else {
+    p.batch = 1;
+    for (int i = 0; i < b_dims - 2; i++) {
+      p.batch *= o_s[i];
+    }
+    int right_batch = 1;
+    for (int i = 0; i < b_dims - 2; i++) {
+      right_batch *= b_s[i];
+    }
+    // if right batch dim is broadcast, merge left batch to M
+    if (right_batch != p.batch && right_batch == 1) {
+      p.batch = 1;
+    }
+    if (p.batch > 1 || o_dims <= 2) {
+      p.M = o_s[o_dims - 2];
+    } else {
+      p.M = std::accumulate(o_s.begin(), o_s.begin() + o_dims - 1, 1,
+                            std::multiplies<int64_t>());
+    }
   }
   return p;
 }
@@ -61,10 +99,9 @@ matmul_attr_t tpu::MatMulOp::parseParam() {
 LogicalResult tpu::MatMulOp::init(InferenceParameter &p) {
   auto matmul = new MatMul();
   auto a = parseParam();
-
   matmul->setup(p.inputs[0], p.inputs[1], p.inputs[2], p.outputs[0], a.batch,
                 a.M, a.K, a.N, a.do_relu, a.relu_limit, a.right_zp,
-                a.right_transpose, a.input_zp);
+                a.right_transpose, a.input_zp, getHdimIsBatch(), a.batch_low);
   p.handle = (void *)matmul;
   return success();
 }

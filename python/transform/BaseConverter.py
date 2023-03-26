@@ -53,16 +53,18 @@ class BaseConverter(object):
         return self.getOperand(name)
 
     def addWeight(self, name, data):
-        if name in self.tensors:
-            raise KeyError("tensor {} conflict".format(name))
         if not isinstance(data, np.ndarray):
             raise KeyError("tensor data must be numpy array")
+        if data.dtype != np.float32:
+            data = data.astype(np.float32)
+        if name in self.tensors:
+            if self.tensors[name] == data:
+                return
+            raise KeyError("tensor {} conflict".format(name))
         if len(data.shape) == 0:
             data = data.reshape([1])
-        if data.dtype == np.int64:
-            self.tensors[name] = data.astype(np.float32)
-        else:
-            self.tensors[name] = data
+        # all weight convert to f32.
+        self.tensors[name] = data
         self.addShape(name, data.shape)
 
     def isWeight(self, name):
@@ -82,7 +84,7 @@ class BaseConverter(object):
         return np.all(w == w.flatten()[0])
 
     def isScalar_(self, name, x):
-        assert(isinstance(x, (int, float)))
+        assert (isinstance(x, (int, float)))
         if not self.isWeight(name): return False
         if np.prod(self.getShape(name)) == 1: return True
         w = self.getWeight(name)
@@ -100,13 +102,18 @@ class BaseConverter(object):
         if shape and old_shape != shape:
             assert (np.prod(old_shape) == np.prod(shape))
             old_shape = shape
-        tp = self.tensors[name].dtype  # Ugly workaround
-        type_convert_dict = {np.dtype('int8'): "INT8", np.dtype('float32'): "F32"}
-        try:
-            tp = type_convert_dict[tp]
-        except:
-            tp = "F32"
-        op = self.mlir.create_weight_op(name, old_shape, tp)
+        ori_type = str(self.tensors[name].dtype)
+        type_dict = {
+            'int8': "INT8",
+            'uint8': "UINT8",
+            'float32': "F32",
+            'int32': "INT32",
+            'int16': "INT16",
+            'uint16': "UINT16",
+        }
+        if ori_type not in type_dict:
+            raise KeyError("type {} not implemented".format(ori_type))
+        op = self.mlir.create_weight_op(name, old_shape, type_dict[ori_type])
         self.addOperand(name, op)
         return op
 

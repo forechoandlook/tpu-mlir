@@ -49,6 +49,11 @@ typedef void (*tensor_broadcast_move_gen_cmd)(
     uint32_t dst_H_stride, int data_format, int stride_enable, int direction,
     CMD_ID_NODE *pid_node);
 
+typedef void (*tensor_align_move_gen_cmd)(
+    int local_mem_start_addr, int local_mem_idx, uint64_t sys_mem_start_addr,
+    int src_N, int src_C, int src_H, int src_W, int src_format, int direction,
+    int transpose, CMD_ID_NODE *pid_node);
+
 typedef void (*set_total_id_ptr)(uint32_t *gdma_total_id_ptr,
                                  uint32_t *bdc_total_id_ptr, void *cmdid_node,
                                  void *gdma_group_id_ptr,
@@ -58,15 +63,25 @@ typedef void (*cmd_id_divide)(void *p_cmd_src, void *p_cmd_dst0,
 typedef void (*cmd_id_merge)(void *p_cmd_dst, void *p_cmd_src0,
                              void *p_cmd_src1);
 typedef void (*sg_set_profile_dump)(bool enable);
+typedef void (*sg_set_profile_path)(const char* path);
 typedef void (*sg_stas_dump)(void *pid_node);
 typedef void (*sg_flops_dump)(long long flops, void *pid_node);
 typedef void (*sg_stas_reset)();
+
+// for cpuop
+typedef void* (*bmcpu_init)();
+typedef void (*bmcpu_uninit)(void *);
+typedef void (*bmcpu_process)(void *, int, void *, int, const std::vector<float *>&, const std::vector<std::vector<int>>&, const std::vector<float *>&, std::vector<std::vector<int>>&);
+typedef int (*bmcpu_reshape)(void *, int, void *, int, const std::vector<std::vector<int>>&, std::vector<std::vector<int>>&);
+typedef int  (*bmcpu_dtype)(void* bmcpu_handle, int op_type, const void *param, size_t param_size, const std::vector<int> &input_dtypes, std::vector<int> &output_dtypes);
 
 namespace tpu_mlir {
 namespace backend {
 
 #define CAST_FUNCTION(name) dl_##name = CastToFPtr<name>(#name)
 #define CAST_FUNCTION_WITH_SYM(name, sym) dl_##name = CastToFPtr<name>(#sym)
+#define CAST_CPU_FUNCTION(name) dl_##name = CpuCastToFPtr<name>(#name)
+
 
 class BM168x : public Arch {
 
@@ -155,13 +170,31 @@ public:
   tensor_stride_move_gen_cmd dl_tensor_stride_move_gen_cmd;
   tensor_compact_move_gen_cmd dl_tensor_compact_move_gen_cmd;
   tensor_broadcast_move_gen_cmd dl_tensor_broadcast_move_gen_cmd;
+  tensor_align_move_gen_cmd dl_tensor_align_move_gen_cmd;
   set_total_id_ptr dl_set_total_id_ptr;
   cmd_id_divide dl_cmd_id_divide;
   cmd_id_merge dl_cmd_id_merge;
   sg_set_profile_dump dl_sg_set_profile_dump;
+  sg_set_profile_path dl_sg_set_profile_path;
   sg_stas_dump dl_sg_stas_dump;
   sg_flops_dump dl_sg_flops_dump;
   sg_stas_reset dl_sg_stas_reset;
+  bmcpu_init dl_bmcpu_init;
+  bmcpu_uninit dl_bmcpu_uninit;
+  bmcpu_process dl_bmcpu_process;
+  bmcpu_reshape dl_bmcpu_reshape;
+  bmcpu_dtype dl_bmcpu_dtype;
+
+  template <typename FPtrTy> FPtrTy CpuCastToFPtr(const char *symbolName) {
+  assert(cpuopDL.isValid());
+  auto fPtr = cpuopDL.getAddressOfSymbol(symbolName);
+  if (fPtr == nullptr) {
+    llvm::errs() << "can't find symbol: " << symbolName << "\n";
+    llvm_unreachable(symbolName);
+  }
+  return reinterpret_cast<FPtrTy>(fPtr);
+}
+
 
 public:
   // -------------------------------------------------------------------
@@ -195,6 +228,12 @@ public:
     dl_forbid_store_cmd();
   }
 
+  // for cpu layer
+  void bmcpu_setup();
+  // void set_net_cpu_mem_size(int32_t size) {
+  //   net_cpu_mem_size[cur_net_idx] = size;
+  // }
+
 public:
   std::vector<uint32_t> bdc_buffer;
   std::vector<uint32_t> gdma_buffer;
@@ -208,7 +247,10 @@ public:
   void *cmdid_node;
   void *bdc_node;
   void *gdma_node;
-
+  void *bmcpu_handle;
+  std::map<int, uint32_t> net_cpu_mem_size;
+  llvm::sys::DynamicLibrary cpuopDL;
+  llvm::StringRef libcpuop = "libcpuop.so";
 protected:
   BM168x(){};
   virtual ~BM168x() = 0;
@@ -219,6 +261,7 @@ protected:
 protected:
   static BM168x *bm168x;
   bool really_issue_command;
+
 };
 
 } // namespace backend

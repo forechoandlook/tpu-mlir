@@ -18,6 +18,7 @@ from tools.model_runner import mlir_inference, model_inference, show_fake_cmd
 import pymlir
 from utils.misc import str2bool
 
+
 def str2list(v):
     files = v.split(',')
     files = [s.strip() for s in files]
@@ -52,7 +53,7 @@ class DeployTool:
 
     def __init__(self, args):
         self.mlir_file = args.mlir
-        self.chip = args.chip.lower()
+        self.chip = args.chip
         self.excepts = args.excepts
         self.tolerance = args.tolerance
         self.test_input = args.test_input
@@ -71,6 +72,7 @@ class DeployTool:
         self.module_name = self.module.module_name
         self.state = self.module.module_state
         self.disable_layer_group = args.disable_layer_group
+        self.merge_weight = args.merge_weight
         self.correctness = "0.99,0.90"
         if self.quantize_table:
             self.correctness = "0.99,0.85"
@@ -107,7 +109,9 @@ class DeployTool:
                 ppa = preprocess()
                 input_op = self.module.inputs[0].op
                 ppa.load_config(input_op)
-                self.customization_format = getCustomFormat(ppa.pixel_format, ppa.channel_format)
+                if ppa.has_pre:
+                    self.customization_format = getCustomFormat(ppa.pixel_format,
+                                                                ppa.channel_format)
             return
         self.inputs = {}
         #self.pre_inputs = {}
@@ -141,6 +145,8 @@ class DeployTool:
                         "pixel_format": ppa.pixel_format,
                         'customization_format': self.customization_format,
                         'aligned': self.aligned_input,
+                        'pad_type': ppa.pad_type,
+                        'pad_value': ppa.pad_value,
                         'chip': self.chip,
                     }
                     print("Add preprocess, set the following params:")
@@ -211,6 +217,7 @@ class DeployTool:
             self.quant_input,
             self.quant_output,
             self.disable_layer_group,
+            self.merge_weight,
         )
         if self.do_validate:
             tool.validate_model()
@@ -218,13 +225,15 @@ class DeployTool:
     def validate_model(self):
         self.model_npz = "{}_model_outputs.npz".format(self.prefix)
         file_mark(self.model_npz)
-        show_fake_cmd(self.in_f32_npz, self.model, self.model_npz, self.post_op)
-        model_outputs = model_inference(self.inputs, self.model, self.post_op)
+        show_fake_cmd(self.in_f32_npz, self.model, self.model_npz)
+        model_outputs = model_inference(self.inputs, self.model)
         np.savez(self.model_npz, **model_outputs)
         if self.state == "TOP_QUANTIZED":
-            f32_blobs_compare(self.model_npz, self.ref_npz, self.correctness, self.excepts, self.post_op)
+            f32_blobs_compare(self.model_npz, self.ref_npz, self.correctness, self.excepts,
+                              self.post_op)
         else:
-            f32_blobs_compare(self.model_npz, self.tpu_npz, self.correctness, self.excepts, self.post_op)
+            f32_blobs_compare(self.model_npz, self.tpu_npz, self.correctness, self.excepts,
+                              self.post_op)
 
 
 if __name__ == '__main__':
@@ -237,11 +246,11 @@ if __name__ == '__main__':
                         help="calibration table for int8 quantization")
     parser.add_argument("--quantize_table",
                         help="table of OPs that quantized to specific mode")
-    parser.add_argument("--quantize", default="F32", type=str, choices=['F32', 'BF16', 'F16', 'INT8', 'QDQ'],
+    parser.add_argument("--quantize", default="F32", type=str.upper, choices=['F32', 'BF16', 'F16', 'INT8', 'QDQ'],
                         help="set default qauntization type: F32/BF16/F16/INT8")
     parser.add_argument("--asymmetric", action='store_true',
                         help="do INT8 asymmetric quantization")
-    parser.add_argument("--chip", required=True, type=str,
+    parser.add_argument("--chip", required=True, type=str.lower,
                         choices=['bm1686', 'bm1684x', 'bm1684',
                                  'cv183x', 'cv182x', 'cv181x', 'cv180x'],
                         help="chip platform name")
@@ -251,7 +260,7 @@ if __name__ == '__main__':
     # fuse preprocess
     parser.add_argument("--fuse_preprocess", action='store_true',
                         help="add tpu preprocesses (mean/scale/channel_swap) in the front of model")
-    parser.add_argument("--customization_format", default='', type=str,
+    parser.add_argument("--customization_format", default='', type=str.upper,
                         choices=supported_customization_format,
                         help="pixel format of input frame to the model")
     parser.add_argument("--aligned_input", action='store_true',
@@ -276,6 +285,9 @@ if __name__ == '__main__':
     parser.add_argument("--post_op", action="store_true",
                         help="if the bmodel have post handle op")
     parser.add_argument("--debug", action='store_true', help='to keep all intermediate files for debug')
+    parser.add_argument("--merge_weight", action="store_true", default=False,
+                        help="merge weights into one weight binary with previous generated cvimodel")
+
     # yapf: enable
     args = parser.parse_args()
     if args.customization_format.startswith("YUV"):

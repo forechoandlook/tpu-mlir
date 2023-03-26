@@ -14,8 +14,6 @@
 #include "tpu_mlir/Support/LutFunc.h"
 #include "tpu_mlir/Support/MathUtils.h"
 
-
-
 gru_attr_t tpu::GRUOp::parseParam() {
   gru_attr_t attr = {0};
   auto in_shape = module::getShape(getInput());
@@ -65,6 +63,13 @@ public:
     if (attr.num_direction == 2) {
       gru_compute(p, attr, B, initial_h, false);
     }
+    if (p.handle) {
+      float *buffer = (float *)p.handle;
+      function_permute(buffer, p.outputs[0],
+                       {1, attr.seq_len, attr.num_direction, attr.batch_size,
+                        attr.hidden_size},
+                       {0, 1, 3, 2, 4});
+    }
   }
 
 private:
@@ -73,7 +78,7 @@ private:
     //(TODO) num_layers > 1
     // input += seq_length * batch * input_size * num_layer; //(TODO check!)
     float *input = p.inputs[0];
-    float *output = p.outputs[0];
+    float *output = p.handle != nullptr ? (float *)p.handle : p.outputs[0];
     float *x_wz = p.inputs[1];
     float *h_wz = p.inputs[2];
     float *x_bz = bias;
@@ -180,7 +185,9 @@ public:
     int num_dir;
     bool bidirectional;
     bool linear_before_reset;
-    bool only_last;
+    bool has_y = false;
+    ;
+    bool has_yh = false;
     float *r_z;
     float *r_r;
     float *r_h;
@@ -188,59 +195,55 @@ public:
     float *r_br;
     float *r_bh;
     float *input;
-    float *output;
+    float *output_y = nullptr;
+    float *output_yh = nullptr;
     float *prev_hidden_state;
     float *sigmoid_lut;
     float *sigmoid_slope_lut;
     float *tanh_lut;
     float *tanh_slope_lut;
-    uint32_t out_idx;
+    uint32_t out_y_idx = 0;
+    uint32_t out_yh_idx = 0;
   };
 
   static void inference(InferenceParameter &p, tpu::GRUOp *op) {
     cv_gru_param_t gp;
-    auto input_type = op->getInput().getType().dyn_cast<TensorType>();
-    auto in_shape = module::getShape(op->getInput());
-    Value output;
-    for (uint32_t i = 0; i < op->getNumResults(); ++i) {
-      if (!module::isNone(op->getResults()[i])) {
-        output = op->getResults()[i];
-        gp.out_idx = i;
-        break;
-      }
-    }
-    assert(output);
-    auto out_shape = module::getShape(output);
-    if (out_shape.size() == 4) {
-      gp.seq_length = out_shape[0];
-      gp.num_dir = out_shape[1];
-      gp.batch_size = out_shape[2];
-      gp.hidden_size = out_shape[3];
-      assert(in_shape[0] == gp.seq_length);
-      gp.only_last = false;
-    } else {
-      gp.seq_length = in_shape[0];
-      gp.num_dir = out_shape[0];
-      gp.batch_size = out_shape[1];
-      gp.hidden_size = out_shape[2];
-      gp.only_last = true;
-    }
-    assert(in_shape.size() == 3);
-    assert(in_shape[1] == gp.batch_size);
-    gp.input_size = in_shape[2];
+    auto attr = op->parseParam();
+    gp.seq_length = attr.seq_len;
+    gp.num_dir = attr.num_direction;
+    gp.batch_size = attr.batch_size;
+    gp.hidden_size = attr.hidden_size;
+    gp.input_size = attr.input_size;
     gp.linear_before_reset = op->getLinearBeforeReset();
-    assert(gp.linear_before_reset == true);
     gp.bidirectional = op->getBidirectional();
+    if (attr.output_y) {
+      gp.has_y = attr.output_y;
+      gp.out_y_idx = 0;
+      gp.output_y = p.outputs[gp.out_y_idx];
+    }
+    if (attr.output_yh) {
+      gp.has_yh = attr.output_yh;
+      gp.out_yh_idx = 1;
+      gp.output_yh = p.outputs[gp.out_yh_idx];
+    }
 
-    auto out_type = module::getStorageType(output);
-    bool is_bf16 = out_type.isBF16();
+    assert(gp.has_y || gp.has_yh);
+    assert(gp.linear_before_reset == true);
+    bool is_bf16 = module::getStorageType(op->getInput()).isBF16();
     compute(true, p, gp, is_bf16);
     if (gp.bidirectional) {
       compute(false, p, gp, is_bf16);
     }
     if (is_bf16) {
-      auto ele_num = module::getNumElements(output);
-      BF16(p.outputs[gp.out_idx], p.outputs[gp.out_idx], ele_num, false);
+      if (gp.has_y) {
+        auto ele_num = module::getNumElements(op->getY());
+        BF16(p.outputs[gp.out_y_idx], p.outputs[gp.out_y_idx], ele_num, false);
+      }
+      if (gp.has_yh) {
+        auto ele_num = module::getNumElements(op->getYH());
+        BF16(p.outputs[gp.out_yh_idx], p.outputs[gp.out_yh_idx], ele_num,
+             false);
+      }
     }
   }
 
@@ -269,13 +272,19 @@ private:
     if (forward) {
       gp.r_z = p.inputs[2];
       gp.r_bz = p.inputs[3];
-      gp.output = p.outputs[gp.out_idx];
+      gp.output_y = gp.has_y ? p.outputs[gp.out_y_idx] : 0;
+      gp.output_yh = gp.has_yh ? p.outputs[gp.out_yh_idx] : 0;
       gp.prev_hidden_state = p.inputs[4];
       gp.input = p.inputs[0];
     } else {
       gp.r_z = p.inputs[2] + 3 * gp.hidden_size * gp.hidden_size;
       gp.r_bz = p.inputs[3] + 3 * gp.hidden_size;
-      gp.output = p.outputs[gp.out_idx] + gp.batch_size * gp.hidden_size;
+      gp.output_y =
+          gp.has_y ? p.outputs[gp.out_y_idx] + gp.batch_size * gp.hidden_size
+                   : 0;
+      gp.output_yh =
+          gp.has_yh ? p.outputs[gp.out_yh_idx] + gp.batch_size * gp.hidden_size
+                    : 0;
       gp.prev_hidden_state = p.inputs[4] + gp.batch_size * gp.hidden_size;
       gp.input = p.inputs[0] + 3 * gp.hidden_size;
     }
@@ -321,13 +330,11 @@ private:
         float *ug = update_gate.data() + batch * gp.hidden_size;
         float *rg = reset_gate.data() + batch * gp.hidden_size;
         float *hg = hidden_gate.data() + batch * gp.hidden_size;
-        float *hidden_state = nullptr;
         float *pre_state = gp.prev_hidden_state + batch * gp.hidden_size;
-        if (gp.only_last) {
-          hidden_state = gp.output + batch * gp.hidden_size;
-        } else {
+        float *hidden_state = pre_state;
+        if (gp.has_y) {
           hidden_state =
-              gp.output +
+              gp.output_y +
               (seq_idx * gp.num_dir * gp.batch_size + batch) * gp.hidden_size;
         }
 #pragma omp parallel for schedule(static, omp_schedule(gp.hidden_size))
@@ -346,18 +353,40 @@ private:
           }
         }
       }
-      if (gp.only_last) {
-        gp.prev_hidden_state = gp.output;
-      } else {
+      if (gp.has_y) {
         gp.prev_hidden_state =
-            gp.output + seq_idx * gp.num_dir * gp.batch_size * gp.hidden_size;
+            gp.output_y + seq_idx * gp.num_dir * gp.batch_size * gp.hidden_size;
       }
+    }
+    if (gp.has_yh) {
+      memcpy(gp.output_yh, gp.prev_hidden_state,
+             gp.batch_size * gp.hidden_size * sizeof(float));
     }
   }
 };
 
-LogicalResult tpu::GRUOp::init(InferenceParameter &p) { return success(); }
-void tpu::GRUOp::deinit(InferenceParameter &p) {}
+LogicalResult tpu::GRUOp::init(InferenceParameter &p) {
+  if (!module::isPlatform(module::Platform::TORCH)) {
+    return success();
+  }
+  auto attr = parseParam();
+  if (attr.output_y == false || attr.batch_size == 1 ||
+      attr.num_direction == 1) {
+    return success();
+  }
+  auto num = module::getNumElements(getY());
+  float *buffer = new float[num];
+  p.handle = (void *)buffer;
+  return success();
+}
+
+void tpu::GRUOp::deinit(InferenceParameter &p) {
+  if (p.handle) {
+    float *buffer = (float *)p.handle;
+    delete[] buffer;
+    p.handle = nullptr;
+  }
+}
 
 LogicalResult tpu::GRUOp::inference(InferenceParameter &p) {
   if (module::isCV18xx()) {

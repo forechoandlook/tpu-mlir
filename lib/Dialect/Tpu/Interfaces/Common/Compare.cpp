@@ -9,21 +9,53 @@
 
 #include "tpu_mlir/Dialect/Tpu/IR/TpuOps.h"
 #include "tpu_mlir/Support/Dnnl/Dnnl.h"
-
-#include "tpu_mlir/Support/Module.h"
-#include "tpu_mlir/Support/MathUtils.h"
 #include "tpu_mlir/Support/Float16.h"
+#include "tpu_mlir/Support/MathUtils.h"
+#include "tpu_mlir/Support/Module.h"
 
+LogicalResult tpu::CompareOp::init(InferenceParameter &p) {
 
+  std::map<std::string, algorithm> map_mode = {
+      {"Equal", algorithm::binary_eq},
+      {"Greater", algorithm::binary_gt},
+      {"GreaterOrEqual", algorithm::binary_ge},
+      {"Less", algorithm::binary_lt},
+      {"LessOrEqual", algorithm::binary_le}};
 
-LogicalResult tpu::CompareOp::init(InferenceParameter &p) { return success(); }
+  auto binary = new Binary();
+  auto lhs_shape = module::getShape(getOperand(0));
+  auto rhs_shape = module::getShape(getOperand(1));
+
+  auto iter = map_mode.find(getModeAttr().str());
+  algorithm compare_mode;
+  if (iter != map_mode.end()) {
+    compare_mode = iter->second;
+  }
+
+  (*binary)
+      .hs(p.inputs[0], p.inputs[1], lhs_shape, rhs_shape)
+      .dst(p.outputs[0], module::getShape(getOutput()))
+      .algorithem(compare_mode)
+      .setup();
+
+  p.handle = (void *)binary;
+
+  return success();
+}
+
 void tpu::CompareOp::deinit(InferenceParameter &p) {}
 
 LogicalResult tpu::CompareOp::inference(InferenceParameter &p) {
-  auto num_element = module::getNumElements(getOutput());
-#pragma omp parallel for schedule(static, omp_schedule(num_element))
-  for (int i = 0; i < num_element; ++i) {
-    p.outputs[0][i] = compare(p.inputs[0][i], p.inputs[1][i], getMode());
+
+  if (p.handle == nullptr) {
+    return failure();
   }
+  auto binary = (Binary *)p.handle;
+  binary->run();
+
   return success();
+}
+
+LogicalResult tpu::CompareOp::LocalGenSupport() {
+  return BroadCastBinaryLocalGenSupport(getOperation());
 }

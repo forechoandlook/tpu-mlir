@@ -20,7 +20,7 @@ LogicalResult top::DivOp::init(InferenceParameter &p) {
   if (getIsReverse()) {
     index0 = 1, index1 = 0;
   }
-  auto lhs_shape =  module::getShape(getInputs()[index0]);
+  auto lhs_shape = module::getShape(getInputs()[index0]);
   auto rhs_shape = module::getShape(getInputs()[index1]);
 
   (*binary)
@@ -50,4 +50,8 @@ LogicalResult top::DivOp::inference(InferenceParameter &p) {
   auto binary = (Binary *)p.handle;
   binary->run();
   return success();
+}
+
+void top::DivOp::shape_inference() {
+  broadcast_shape_inference(getOperation());
 }

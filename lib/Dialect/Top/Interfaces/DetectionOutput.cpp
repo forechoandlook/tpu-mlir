@@ -38,7 +38,13 @@ LogicalResult top::DetectionOutputOp::inference(InferenceParameter &p) {
   param.background_label_id = this->getBackgroundLabelId();
   param.loc_shape = module::getShape(this->getInputs()[0]);
   param.conf_shape = module::getShape(this->getInputs()[1]);
-  param.prior_shape = module::getShape(this->getInputs()[2]);
+  //onnx ssd just have loc、conf
+  if (this->getInputs().size() >= 3) {
+    param.prior_shape = module::getShape(this->getInputs()[2]);
+    param.onnx_nms = 0;
+  } else {
+    param.onnx_nms = 1;
+  }
 
   std::string str_code_type = this->getCodeType().str();
   if (str_code_type == "CORNER") {
@@ -53,10 +59,12 @@ LogicalResult top::DetectionOutputOp::inference(InferenceParameter &p) {
 
   param.loc_data = p.inputs[0];
   param.conf_data = p.inputs[1];
-  param.prior_data = p.inputs[2];
+  param.prior_data = param.onnx_nms ? nullptr :p.inputs[2];
   param.output_data = p.outputs[0];
 
   DetectionOutputFunc det_func(param);
   det_func.invoke();
   return success();
 }
+
+void top::DetectionOutputOp::shape_inference() {}

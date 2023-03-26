@@ -14,7 +14,7 @@ namespace bm1684x {
 
 void GatherLowering::LoweringF32(PatternRewriter &rewriter,
                                  top::GatherOp op) const {
-  lowering_common_f32<tpu::GatherOp>(rewriter, op);
+  lowering_common_f32<tpu::GatherOp>(rewriter, op, 0, 1);
 }
 
 void GatherLowering::LoweringINT8(PatternRewriter &rewriter, top::GatherOp op,
@@ -27,12 +27,12 @@ void GatherLowering::LoweringINT4(PatternRewriter &rewriter, top::GatherOp op,
 }
 void GatherLowering::LoweringBF16(PatternRewriter &rewriter,
                                   top::GatherOp op) const {
-  lowering_common_bf16<tpu::GatherOp>(rewriter, op);
+  lowering_common_bf16<tpu::GatherOp>(rewriter, op, 0, 1);
 }
 
 void GatherLowering::LoweringF16(PatternRewriter &rewriter,
                                  top::GatherOp op) const {
-  lowering_common_f16<tpu::GatherOp>(rewriter, op);
+  lowering_common_f16<tpu::GatherOp>(rewriter, op, 0, 1);
 }
 
 void GatherLowering::LoweringQuantized(PatternRewriter &rewriter,

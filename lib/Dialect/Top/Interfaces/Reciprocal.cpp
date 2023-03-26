@@ -15,7 +15,7 @@
 
 
 int64_t top::ReciprocalOp::getFLOPs() {
-  return module::getNumElements(getOutput()) * (1 + getDoRelu() ? 1 : 0);
+  return module::getNumElements(getOutput()) * (1 + (getDoRelu() ? 1 : 0));
 }
 
 LogicalResult top::ReciprocalOp::init(InferenceParameter &p) {
@@ -35,4 +35,8 @@ LogicalResult top::ReciprocalOp::inference(InferenceParameter &p) {
     function_relu(p.outputs[0], p.outputs[0], num_elem, limit);
   }
   return success();
+}
+
+void top::ReciprocalOp::shape_inference() {
+  common_shape_inference(getOperation());
 }

@@ -13,6 +13,19 @@
 include "mlir/Pass/PassBase.td"
 
 //===----------------------------------------------------------------------===//
+// before TopToTpu, do some extra conversion
+//===----------------------------------------------------------------------===//
+def DoExtraConversion : Pass<"do-extra-converison", "ModuleOp"> {
+  let summary = "Before lowering, do some extra Op conversions for different chips";
+  let constructor = "tpu_mlir::createDoExtraConversion()";
+  let dependentDialects = ["tpu_mlir::top::TopDialect", "tpu_mlir::tpu::TpuDialect"];
+  let options = [
+    Option<"chip", "chip", "std::string", /*default=*/"",
+           "chip: cv183x/cv182x/bm1684/bm1684x">,
+  ];
+}
+
+//===----------------------------------------------------------------------===//
 // TopToTpu
 //===----------------------------------------------------------------------===//
 
@@ -29,6 +42,20 @@ def ConvertTopToTpu : Pass<"convert-top-to-tpu", "ModuleOp"> {
            "chip: cv183x/cv182x/bm1684/bm1684x">,
     Option<"isAsymmetric", "asymmetric", "bool", /*default=*/"false",
            "true for asymmetric quantization, or false for symmetric">,
+  ];
+}
+
+
+//===----------------------------------------------------------------------===//
+// TopToTosa
+//===----------------------------------------------------------------------===//
+def ConvertTopToTosa : Pass<"convert-top-to-tosa", "ModuleOp"> {
+  let summary = "Convert top-level Top Ops to Tosa Ops";
+  let constructor = "tpu_mlir::createConvertTopToTosa()";
+  let dependentDialects = ["tpu_mlir::top::TopDialect", "mlir::tosa::TosaDialect"];
+  let options = [
+    Option<"includeWeight", "includeWeight", "bool", /*default=*/"false",
+           "true for including weight datas in tosa.mlir, or false for not">,
   ];
 }
 

@@ -12,8 +12,6 @@
 #include "tpu_mlir/Support/Module.h"
 #include "tpu_mlir/Support/MathUtils.h"
 
-
-
 int64_t top::SqueezeOp::getFLOPs() { return 0; }
 
 LogicalResult top::SqueezeOp::init(InferenceParameter &p) { return success(); }
@@ -26,4 +24,24 @@ LogicalResult top::SqueezeOp::inference(InferenceParameter &p) {
     p.outputs[0][i] = p.inputs[0][i];
   }
   return success();
+}
+
+void top::SqueezeOp::shape_inference() {
+  auto in_shape = module::getShape(getInputs());
+  auto axes = module::getI64Array(getAxesAttr());
+  std::vector<int64_t> out_shape;
+  int64_t in_dims = in_shape.size();
+  for (int i = 0; i < in_dims; ++i) {
+    out_shape.push_back(in_shape[i]);
+    for (auto axis : *axes) {
+      if (axis < 0) {
+        axis += in_dims;
+      }
+      if (axis == i) {
+        out_shape.pop_back();
+      }
+    }
+  }
+  module::setShapeOrVerify(getOutput(), out_shape);
+  // common_shape_inference(getOperation());
 }

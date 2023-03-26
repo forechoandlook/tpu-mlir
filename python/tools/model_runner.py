@@ -16,6 +16,7 @@ import struct
 import shutil
 from utils.misc import str2bool
 
+
 def round_away_from_zero(x):
     a = np.floor(np.abs(x) + 0.5)
     return np.sign(x) * a
@@ -42,9 +43,8 @@ def fp32_to_bf16(d_fp32):
     return d_bf16.reshape(s)
 
 
-def show_fake_cmd(in_npz: str, model: str, out_npz: str, post_op=False):
-    post_param = "" if not post_op else "--post_op"
-    print("[CMD]: model_runner.py --input {} --model {} --output {} {}".format(in_npz, model, out_npz, post_param))
+def show_fake_cmd(in_npz: str, model: str, out_npz: str):
+    print("[CMD]: model_runner.py --input {} --model {} --output {}".format(in_npz, model, out_npz))
 
 
 def get_chip_from_model(model_file: str) -> str:
@@ -53,6 +53,7 @@ def get_chip_from_model(model_file: str) -> str:
     fd.close()
     return chip
 
+
 def is_dynamic_model(model_file: str) -> str:
     fd = os.popen("model_tool --is_dynamic {}".format(model_file))
     dynamic = fd.read()
@@ -60,6 +61,7 @@ def is_dynamic_model(model_file: str) -> str:
     if dynamic == 'true':
         return True
     return False
+
 
 def pack_bmodel_context(model_file, net):
     out_dir = model_file.rsplit(".", maxsplit=1)[0]
@@ -73,13 +75,13 @@ def pack_bmodel_context(model_file, net):
             o.data.tofile(f)
 
 
-def model_inference(inputs: dict, model_file: str, post_op=False) -> dict:
+def model_inference(inputs: dict, model_file: str) -> dict:
     pyruntime = "pyruntime_"
     is_cv18xx = False
     is_dynamic = False
     if model_file.endswith(".bmodel"):
         pyruntime = pyruntime + "bm"
-        is_dynamic = is_dynamic_model(model_file) or post_op
+        is_dynamic = is_dynamic_model(model_file)
         chip = get_chip_from_model(model_file)
         # trick for runtime link chip cmodel
         lib_so = 'libcmodel_1684x.so'
@@ -111,12 +113,14 @@ def model_inference(inputs: dict, model_file: str, post_op=False) -> dict:
         if is_cv18xx and i.aligned:
             overflow = i.size - np.prod(input.shape)
         if is_dynamic:
-            assert(len(i.data.shape) == len(input.shape))
-            for max,dim in zip(i.data.shape, input.shape):
+            assert (len(i.data.shape) == len(input.shape))
+            for max, dim in zip(i.data.shape, input.shape):
                 if dim > max:
-                    raise RuntimeError("Error shape: form {} to {}".format(i.data.shape, input.shape))
+                    raise RuntimeError("Error shape: form {} to {}".format(
+                        i.data.shape, input.shape))
             dyn_input_shapes.append(input.shape)
-            input = np.concatenate([input.flatten(), np.zeros([overflow]).astype(input.dtype)]).reshape(i.data.shape)
+            input = np.concatenate([input.flatten(),
+                                    np.zeros([overflow]).astype(input.dtype)]).reshape(i.data.shape)
         elif overflow != 0:
             raise RuntimeError("Error shape: form {} to {}".format(i.data.shape, input.shape))
         zp = i.qzero_point
@@ -133,6 +137,8 @@ def model_inference(inputs: dict, model_file: str, post_op=False) -> dict:
         elif i.dtype == "bf16" and input.dtype == np.float32:
             i.data[:] = fp32_to_bf16(input)
         elif i.dtype == "i32" and input.dtype == np.float32:
+            i.data[:] = input.astype(np.int32).reshape(i.data.shape)
+        elif i.dtype == "i32" and input.dtype == np.int64:
             i.data[:] = input.astype(np.int32)
         elif i.dtype == "i4" and input.dtype == np.float32:
             data = round_away_from_zero(input * i.qscale + zp)
@@ -166,7 +172,8 @@ def model_inference(inputs: dict, model_file: str, post_op=False) -> dict:
         if is_dynamic:
             if outputs[i.name].shape != dyn_output_shapes[dyn_idx]:
                 dyn_len = np.prod(dyn_output_shapes[dyn_idx])
-                outputs[i.name] = outputs[i.name].flatten()[:dyn_len].reshape(*dyn_output_shapes[dyn_idx])
+                outputs[i.name] = outputs[i.name].flatten()[:dyn_len].reshape(
+                    *dyn_output_shapes[dyn_idx])
                 dyn_idx += 1
     if not is_cv18xx:
         pack_bmodel_context(model_file, net)
@@ -176,15 +183,16 @@ def model_inference(inputs: dict, model_file: str, post_op=False) -> dict:
 def mlir_inference(inputs: dict, mlir_file: str, dump_all: bool = True, debug=None) -> dict:
 
     import pymlir
+    from utils.mlir_parser import MlirParser
 
-    if debug is not None:
-        if debug == "":
-            pymlir.debug([])
-        else:
-            pymlir.debug(debug.split(","))
+    if debug == "":
+        pymlir.debug()
+    elif debug:
+        pymlir.debug(debug.split(","))
 
     module = pymlir.module()
     module.load(mlir_file)
+    parser = MlirParser(mlir_file)
     for name in module.input_names:
         assert (name in inputs)
         input = inputs[name]
@@ -199,6 +207,13 @@ def mlir_inference(inputs: dict, mlir_file: str, dump_all: bool = True, debug=No
     outputs = dict()
     for name in module.output_names:
         outputs[name] = tensors[name]
+    for name in module.output_names:
+        # assume output of op has the same name
+        op_type = parser.get_op_type_by_op_name(name)
+        if op_type == "tpu.Cast":
+            pre_op = parser.get_pre_op_by_op_name(name)
+            for op in pre_op:
+                outputs[op] = tensors[op]
     return outputs
 
 
@@ -241,6 +256,8 @@ def onnx_inference(inputs: dict, onnx_file: str, dump_all: bool = True) -> dict:
             dtype = np.int64
         elif node.type == 'tensor(bool)':
             dtype = np.bool
+        elif node.type == 'tensor(int32)':
+            dtype = np.int32
         data[name] = inputs[name].astype(dtype)
     outs = session.run(None, data)
     outputs = dict()
@@ -253,9 +270,7 @@ def onnx_inference(inputs: dict, onnx_file: str, dump_all: bool = True) -> dict:
         output_num = len(outs) - len(output_keys)
         outs = outs[output_num:]
         os.remove(onnx_file)
-        return dict(
-            filter(lambda x: isinstance(x[1], np.ndarray), zip(output_keys, outs))
-        )
+        return dict(filter(lambda x: isinstance(x[1], np.ndarray), zip(output_keys, outs)))
 
 
 def caffe_inference(inputs: dict, prototxt: str, caffemodel: str, dump_all: bool = True) -> dict:
@@ -333,17 +348,35 @@ def tflite_inference(
     else:
         return {k["name"]: out_tensor_process((k, v)) for k, v in outputs}
 
-
-def pytorch_inference(inputs: dict, model: str, dump_all: bool = True) -> dict:
+def torch_inference(inputs: dict, model: str, dump_all: bool = True) -> dict:
     import torch
+    idx = 0
+    def torch_outputs(outputs:dict, names:list, tensors):
+        nonlocal idx
+        if isinstance(tensors, torch.Tensor):
+            outputs[names[idx]] = tensors.numpy()
+            idx += 1
+            return
+        if isinstance(tensors, tuple) or isinstance(tensors, list):
+            for t in tensors:
+                torch_outputs(outputs, names, t)
+        else:
+            raise RuntimeError("Not Implemented")
+
     net = torch.jit.load(model, map_location=torch.device('cpu'))
     net.eval()
-    in_tensors = [torch.from_numpy(v) for k,v in inputs.items()]
+    in_tensors = [torch.from_numpy(v) for k, v in inputs.items()]
     with torch.no_grad():
         out_tensors = net(*in_tensors)
     outputs = {}
-    if len(list(net.graph.outputs())) == 1:
-        outputs[list(net.graph.outputs())[0].debugName()] = out_tensors.numpy()
+    names = []
+    for out in net.inlined_graph.outputs():
+        if out.node().kind() == 'prim::TupleConstruct':
+            ins = out.node().inputs()
+            names.extend([i.debugName() for i in ins])
+        else:
+            names.append(out.debugName())
+    torch_outputs(outputs, names, out_tensors)
     return outputs
 
 
@@ -359,8 +392,7 @@ if __name__ == '__main__':
                         help="dump all tensors to output file")
     parser.add_argument("--debug", type=str, nargs="?", const="",
                         help="configure the debugging information.")
-    parser.add_argument("--post_op", action='store_true',
-                        help="if the bmodel have post handle op")
+
     # yapf: enable
     args = parser.parse_args()
     data = np.load(args.input)
@@ -373,8 +405,10 @@ if __name__ == '__main__':
         output = tflite_inference(data, args.model, args.dump_all_tensors)
     elif args.model.endswith(".prototxt") and args.weight.endswith(".caffemodel"):
         output = caffe_inference(data, args.model, args.weight, args.dump_all_tensors)
+    elif args.model.endswith(".pt") or args.model.endswith(".pth"):
+        output = torch_inference(data, args.model, args.dump_all_tensors)
     elif args.model.endswith(".bmodel") or args.model.endswith(".cvimodel"):
-        output = model_inference(data, args.model, args.post_op)
+        output = model_inference(data, args.model)
     else:
         raise RuntimeError("not support modle file:{}".format(args.model))
     np.savez(args.output, **output)

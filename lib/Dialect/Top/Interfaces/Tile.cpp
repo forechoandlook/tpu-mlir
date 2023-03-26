@@ -42,3 +42,12 @@ LogicalResult top::TileOp::inference(InferenceParameter &p) {
   }
   return success();
 }
+
+void top::TileOp::shape_inference() {
+  auto axis_ = getAxis();
+  auto tile_ = getTile();
+  auto in0_shape = module::getShape(getInput());
+  std::vector<int64_t> out_shape(in0_shape);
+  out_shape[axis_] *= tile_;
+  module::setShapeOrVerify(getOutput(), out_shape);
+}

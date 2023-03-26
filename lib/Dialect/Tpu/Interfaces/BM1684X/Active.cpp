@@ -10,6 +10,7 @@
 #include "tpu_mlir/Backend/BM168x/BM1684X.h"
 #include "tpu_mlir/Dialect/Tpu/IR/TpuOps.h"
 #include "tpu_mlir/Support/MathUtils.h"
+#include "tpu_mlir/Dialect/Tpu/Transforms/BM168x/DynCompileCommon.hpp"
 #include "tpu_mlir/Support/Module.h"
 
 using namespace tpu_mlir::backend;
@@ -59,6 +60,7 @@ int64_t tpu::ActiveOp::getBufferSize_bm1684x(
   case ActiveMode::MISH:
   case ActiveMode::EXP:
   case ActiveMode::ELU:
+  case ActiveMode::LOG_SIGMOID:
   case ActiveMode::SOFT_PLUS:
   case ActiveMode::SILU:
   case ActiveMode::SIGMOID:
@@ -120,8 +122,7 @@ int64_t tpu::ActiveOp::dyn_codegen_local_bm1684x(void *buffer) {
   if (!buffer)
     return sizeof(active_local_spec_t);
   auto gi = getGroupInfo(0, 0);
-  active_local_spec_t spec;
-  memset(&spec, 0, sizeof(spec));
+  active_local_spec_t spec = {0};
   spec.common.active_type = (int)getMode();
   spec.buffer_addr = gi.buffer_addr;
   if (getCoeffs().has_value()) {
@@ -150,4 +151,8 @@ int64_t tpu::ActiveOp::dyn_codegen_global_bm1684x(void *buffer) {
     }
   }
   return BM168x::dynamic_spec_to_buffer(buffer, spec);
+}
+
+int64_t tpu::ActiveOp::get_fw_type_bm1684x() {
+  return FW_BMNET_ACTIVE;
 }

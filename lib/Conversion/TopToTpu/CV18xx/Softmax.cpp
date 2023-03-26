@@ -24,13 +24,18 @@ void SoftmaxLowering::LoweringBF16(PatternRewriter &rewriter,
       reciprocal_mantissa_table_weight;
   createBf16LutOp(op, "slope", TableMode::Slope, 0.0, 0.0, -15, 15, active_exp,
                   table_weight, slope_table_weight);
-  createBf16LutOp(op, "pow", TableMode::Mantissa, -1.0, 0.0, -62, 63, nullptr,
-                  reciprocal_table_weight, reciprocal_mantissa_table_weight);
+  if (op.getLog()) {
+    createBf16LutOp(op, "log", TableMode::Mantissa, 0.0, 0.0, -62, 63, nullptr,
+                    reciprocal_table_weight, reciprocal_mantissa_table_weight);
+  } else {
+    createBf16LutOp(op, "pow", TableMode::Mantissa, -1.0, 0.0, -62, 63, nullptr,
+                    reciprocal_table_weight, reciprocal_mantissa_table_weight);
+  }
   auto newType = getQuantBF16Type(op.getOutput());
   rewriter.replaceOpWithNewOp<tpu::SoftmaxOp>(
       op, newType,
       ValueRange{op.getInput(), table_weight, slope_table_weight,
-                 reciprocal_table_weight, reciprocal_mantissa_table_weight},
+                 reciprocal_table_weight, reciprocal_mantissa_table_weight, module::getNoneOp(op.getOperation())},
       op->getAttrs());
   return;
 }

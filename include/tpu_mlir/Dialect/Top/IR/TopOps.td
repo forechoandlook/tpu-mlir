@@ -22,6 +22,7 @@ include "mlir/IR/OpBase.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 include "tpu_mlir/Interfaces/InferenceInterface.td"
 include "tpu_mlir/Interfaces/FlopsInterface.td"
+include "tpu_mlir/Interfaces/ShapeInterface.td"
 include "tpu_mlir/Traits/Traits.td"
 
 // =============================================================================
@@ -71,25 +72,21 @@ def ChannelFormatAttr: AnyStrAttrOf<["nhwc","nchw"]>;
 def PadModeAttr: AnyStrAttrOf<["normal","center"]>;
 def DetectionOutputCodeTypeAttr: AnyStrAttrOf<["CORNER", "CENTER_SIZE", "CORNER_SIZE"]>;
 def RoiAlignModeAttr: AnyStrAttrOf<["Avg","Max"]>;
+def NonZeroOrderAttr: AnyStrAttrOf<["ColMajor","RowMajor"]>;
 
 //===----------------------------------------------------------------------===//
 // TOP Types.
 //===----------------------------------------------------------------------===//
 
-def AnyTenor: AnyTypeOf<[AnyRankedTensor]>;
-def AnyTensorOrNone: AnyTypeOf<[AnyRankedTensor, NoneType]>;
+def AnyTensorOrNone: AnyTypeOf<[AnyTensor, NoneType]>;
 
 //===----------------------------------------------------------------------===//
 // TOP Op Definition.
 //===----------------------------------------------------------------------===//
 
+// === BaseOp =====
 class Top_BaseOp<string mnemonic, list<Trait> traits = []> :
     Op<Top_Dialect, mnemonic, traits> ;
-
-class Top_Op<string mnemonic, list<Trait> traits = []> :
-    Top_BaseOp<mnemonic, !listconcat(traits,
-       [DeclareOpInterfaceMethods<InferenceInterface>,
-        DeclareOpInterfaceMethods<FlopsInterface>])> ;
 
 def Top_NoneOp : Top_BaseOp<"None"> {
   let summary = "none operator";
@@ -111,10 +108,11 @@ def Top_WeightOp : Top_BaseOp<"Weight"> {
   }];
 
   let arguments = (ins
-    OptionalAttr<F64ArrayAttr>:$scale
+    OptionalAttr<F64ArrayAttr>:$scale,
+    OptionalAttr<BoolAttr>:$do_compress
   );
 
-  let results = (outs AnyTensor:$output);
+  let results = (outs AnyRankedTensor:$output);
   let extraClassDeclaration = [{
   template<typename T>
   mlir::LogicalResult update(const std::vector<T>& data, size_t count);
@@ -130,6 +128,7 @@ def Top_WeightOp : Top_BaseOp<"Weight"> {
                             mlir::RankedTensorType& type);
   mlir::Value clone_bf16(mlir::Operation * OwnerOp);
   mlir::Value clone_f16(mlir::Operation * OwnerOp);
+  mlir::Value clone_int(mlir::Operation *OwnerOp);
   }];
 }
 
@@ -140,7 +139,7 @@ def Top_InputOp: Top_BaseOp<"Input"> {
   }];
 
   let arguments = (
-    ins AnyTensor:$input,
+    ins AnyRankedTensor:$input,
     // preprocess for input
     OptionalAttr<PixelFormatAttr>:$pixel_format,
     OptionalAttr<ChannelFormatAttr>:$channel_format,
@@ -158,7 +157,42 @@ def Top_InputOp: Top_BaseOp<"Input"> {
   let results = (outs AnyTensor:$output);
 }
 
-def Top_BatchNormOp: Top_Op<"BatchNorm", [SupportFuseRelu, InOutSameShape]> {
+def Top_TupleOp: Top_BaseOp<"Tuple"> {
+  let summary = "Tuple operator";
+  let description = [{
+    gen by torch prim::TupleConstruct, y = (a, b)
+  }];
+
+  let arguments = (ins
+    Variadic<AnyTensor>:$inputs
+  );
+
+  let results = (outs AnyTensor:$output);
+}
+
+def Top_UnTupleOp: Top_BaseOp<"UnTuple"> {
+  let summary = "UnTuple operator";
+  let description = [{
+    gen by torch prim::TupleUnpack, a, b = y
+  }];
+
+  let arguments = (ins
+    Variadic<AnyTensor>:$inputs
+  );
+
+  let results = (outs
+    Variadic<AnyTensor>:$outputs
+  );
+}
+
+// === Function Op =====
+class Top_Op<string mnemonic, list<Trait> traits = []> :
+    Top_BaseOp<mnemonic, !listconcat(traits,
+       [DeclareOpInterfaceMethods<InferenceInterface>,
+        DeclareOpInterfaceMethods<FlopsInterface>,
+        DeclareOpInterfaceMethods<ShapeInterface>])>;
+
+def Top_BatchNormOp: Top_Op<"BatchNorm", [SupportFuseRelu]> {
   let summary = "BatchNormalization operation";
   let description = [{
     Applies Batch Normalization over a 4D input (a mini-batch of 2D inputs
@@ -188,7 +222,7 @@ def Top_BatchNormOp: Top_Op<"BatchNorm", [SupportFuseRelu, InOutSameShape]> {
   let hasCanonicalizer = 1;
 }
 
-def Top_CastOp:Top_Op<"Cast",[InOutSameShape]> {
+def Top_CastOp:Top_Op<"Cast"> {
   let summary = "Cast operation";
   let description = [{
     quant::UniformQuantizedType cast to float type; or float type cast to quant::UniformQuantizedType
@@ -209,7 +243,7 @@ def Top_ConcatOp: Top_Op<"Concat", [SupportFuseRelu]> {
 
   let arguments = (
     ins Variadic<AnyTensor>:$inputs,
-    DefaultValuedAttr<I64Attr, "1">:$axis,
+    DefaultValuedAttr<SI32Attr, "1">:$axis,
     DefaultValuedAttr<BoolAttr, "false">:$do_relu,
     DefaultValuedAttr<F64Attr, "-1.0">:$relu_limit
   );
@@ -228,7 +262,7 @@ def Top_PackOp: Top_Op<"Pack", [SupportFuseRelu]> {
 
   let arguments = (
     ins Variadic<AnyTensor>:$inputs,
-    I64Attr:$axis,
+    SI32Attr:$axis,
     I64Attr:$values_count,
     DefaultValuedAttr<BoolAttr, "false">:$do_relu,
     DefaultValuedAttr<F64Attr, "-1.0">:$relu_limit
@@ -349,6 +383,8 @@ class Top_PoolOp <string mnemonic> : Top_Op<mnemonic,[SupportFuseRelu]> {
     I64ArrayAttr:$kernel_shape,
     I64ArrayAttr:$strides,
     I64ArrayAttr:$pads,
+    OptionalAttr<BoolAttr>:$ceil_mode,
+    DefaultValuedAttr<BoolAttr, "true">:$keepdims,
     DefaultValuedAttr<I64Attr, "0">:$pad_value,
     DefaultValuedAttr<BoolAttr, "false">:$count_include_pad,
     DefaultValuedAttr<BoolAttr, "false">:$do_relu,
@@ -500,7 +536,7 @@ def Top_MaxOp: Top_Op<"Max"> {
   let results = (outs AnyTensor:$output);
 }
 
-def Top_AddConstOp: Top_Op<"AddConst", [SupportFuseRelu, InOutSameShape]> {
+def Top_AddConstOp: Top_Op<"AddConst", [SupportFuseRelu]> {
   let summary = "Add Const operator";
 
   let description = [{
@@ -517,7 +553,7 @@ def Top_AddConstOp: Top_Op<"AddConst", [SupportFuseRelu, InOutSameShape]> {
   let results = (outs AnyTensor:$output);
 }
 
-def Top_MulConstOp: Top_Op<"MulConst", [SupportFuseRelu, InOutSameShape]> {
+def Top_MulConstOp: Top_Op<"MulConst", [SupportFuseRelu]> {
   let summary = "Mul Const operator";
 
   let description = [{
@@ -535,7 +571,7 @@ def Top_MulConstOp: Top_Op<"MulConst", [SupportFuseRelu, InOutSameShape]> {
   let hasCanonicalizer = 1;
 }
 
-def Top_NormalizeOp: Top_Op<"Normalize", [InOutSameShape]> {
+def Top_NormalizeOp: Top_Op<"Normalize"> {
   let summary = "Normalize operator";
 
   let description = [{
@@ -562,7 +598,7 @@ def Top_NormalizeOp: Top_Op<"Normalize", [InOutSameShape]> {
   let hasCanonicalizer = 1;
 }
 
-def Top_ReciprocalOp: Top_Op<"Reciprocal", [SupportFuseRelu, InOutSameShape]> {
+def Top_ReciprocalOp: Top_Op<"Reciprocal", [SupportFuseRelu]> {
   let summary = "Constant scalar divide tensor operator";
 
   let description = [{
@@ -593,6 +629,7 @@ def Top_MatMulOp: Top_Op<"MatMul", [SupportFuseRelu]> {
     AnyTensor:$right,
     AnyTensorOrNone:$bias,
     DefaultValuedAttr<BoolAttr, "false">:$right_transpose,
+    DefaultValuedAttr<BoolAttr, "true">:$keep_dims,
     DefaultValuedAttr<BoolAttr, "false">:$do_relu,
     DefaultValuedAttr<F64Attr, "-1.0">:$relu_limit,
     OptionalAttr<F64Attr>:$in_int4_scale,
@@ -646,6 +683,22 @@ def Top_PermuteOp: Top_Op<"Permute"> {
   }];
 }
 
+def Top_TransposeOp: Top_Op<"Transpose"> {
+
+  let summary = "Transpose operator";
+
+  let description = [{
+      Transpose on input.
+  }];
+
+  let arguments = (
+    ins AnyTensor:$input,
+    SI32Attr:$dim0,
+    SI32Attr:$dim1
+  );
+  let results = (outs AnyTensor:$output);
+}
+
 def Top_ShuffleChannelOp: Top_Op<"ShuffleChannel"> {
   let summary = "ShuffleChannel operator";
 
@@ -661,7 +714,7 @@ def Top_ShuffleChannelOp: Top_Op<"ShuffleChannel"> {
   let results = (outs AnyTensor:$output);
 }
 
-def Top_ReluOp: Top_Op<"Relu",[InOutSameShape]> {
+def Top_ReluOp: Top_Op<"Relu"> {
   let summary = "Relu operator";
 
   let description = [{
@@ -678,21 +731,52 @@ def Top_ReluOp: Top_Op<"Relu",[InOutSameShape]> {
   let hasCanonicalizer = 1;
 }
 
+def Top_ListOp: Top_Op<"List"> {
+  let summary = "List operator";
+  let description = [{
+    gen by torch prim::ListConstruct, y = [a, b]
+    output shape is [1]
+  }];
+
+  let arguments = (ins
+    Variadic<AnyTensor>:$inputs
+  );
+
+  let results = (outs AnyTensor:$output);
+}
+
 def Top_ReshapeOp:Top_Op<"Reshape"> {
   let summary = "Reshape operation";
   let description = [{
     Returns a tensor with the same type/values as the input, with a new shape
     specified by the shape argument. Reshape may operate on tensors of any rank.
     No data conversion happens during a reshape operation.
+    0: keep dim from input
+    -1: left dim from input
   }];
   let arguments = (ins
-    AnyTensor:$input
+    AnyTensor:$input,
+    OptionalAttr<I64ArrayAttr>:$shape
   );
   let results = (outs AnyTensor:$output);
   let hasCanonicalizer = 1;
 }
 
-def Top_ReverseOp:Top_Op<"Reverse", [InOutSameShape]> {
+def Top_ViewOp:Top_Op<"View"> {
+  let summary = "View operation";
+  let description = [{
+    gen by torch aten::view
+    0: keep dim from input
+    -1: left dim from input
+  }];
+  let arguments = (ins
+    AnyTensor:$input,
+    AnyTensor:$shape
+  );
+  let results = (outs AnyTensor:$output);
+}
+
+def Top_ReverseOp:Top_Op<"Reverse"> {
   let summary = "Reverse operation";
   let description = [{
     Reverse on input.
@@ -704,21 +788,63 @@ def Top_ReverseOp:Top_Op<"Reverse", [InOutSameShape]> {
   let results = (outs AnyTensor:$output);
 }
 
-def Top_SigmoidOp : Top_Op<"Sigmoid", [InOutSameShape]> {
+def Top_SigmoidOp : Top_Op<"Sigmoid"> {
   let summary = " Exp operator,  scale * Sigmoid + bias";
   let description = [{
      Y = scale * Sigmoid(x) + bias
+     if log --> Y = Log(scale * Sigmoid(x) + bias)
   }];
   let arguments = (ins
     AnyTensor:$input,
     DefaultValuedAttr<F64Attr, "1">:$scale,
-    DefaultValuedAttr<F64Attr, "0">:$bias
+    DefaultValuedAttr<F64Attr, "0">:$bias,
+    DefaultValuedAttr<BoolAttr, "false">:$log
   );
 
   let results = (outs AnyTensor:$output);
 }
 
-def Top_SiLUOp : Top_Op<"SiLU", [InOutSameShape]> {
+def Top_SoftsignOp: Top_Op<"Softsign"> {
+  let summary = " Softsign Operator";
+  let description = [{
+     Y = x / (1 + |x|)
+  }];
+  let arguments = (
+    ins AnyTensor:$input
+  );
+
+  let results = (outs AnyTensor:$output);
+}
+
+def Top_SizeOp: Top_Op<"Size"> {
+  let summary = "Size operator";
+  let description = [{
+    gen by torch aten::Size
+  }];
+
+  let arguments = (ins
+    AnyTensor:$input,
+    OptionalAttr<SI32Attr>:$axis
+  );
+
+  let results = (outs AnyTensor:$output);
+}
+
+def Top_ZerosOp: Top_Op<"Zeros"> {
+  let summary = "zeros operator";
+  let description = [{
+    gen by torch aten::zeros
+  }];
+  let arguments = (ins
+    AnyTensor:$input
+  );
+
+  let results = (outs
+    AnyTensor:$output
+  );
+}
+
+def Top_SiLUOp : Top_Op<"SiLU"> {
   let summary = " SiLU operator,  y = x * Sigmoid(x)";
   let description = [{
      Y = x * Sigmoid(x)
@@ -730,7 +856,7 @@ def Top_SiLUOp : Top_Op<"SiLU", [InOutSameShape]> {
   let results = (outs AnyTensor:$output);
 }
 
-def Top_GELUOp : Top_Op<"GELU", [InOutSameShape]> {
+def Top_GELUOp : Top_Op<"GELU"> {
   let summary = " GELU operator,  0.5x * (1.0 + tf.erf(x / tf.sqrt(2.0)))";
   let description = [{
      Y = 0.5x * (1.0 + tf.erf(x / tf.sqrt(2.0)))
@@ -792,23 +918,42 @@ def Top_StridedSliceOp: Top_Op<"StridedSlice"> {
     I64Attr:$shrink_axis_mask
   );
   let results = (outs AnyTensor:$output);
+  let hasCanonicalizer = 1;
 }
 
-def Top_SoftmaxOp:Top_Op<"Softmax",[InOutSameShape]> {
+def Top_SliceExOp: Top_Op<"SliceEx"> {
+  let summary = "Select operator";
+
+  let description = [{
+    Select Operation on input.
+  }];
+
+  let arguments = (ins
+    AnyTensor:$input,
+    I64Attr:$axis,
+    I64Attr:$start,
+    I64Attr:$step,
+    I64Attr:$end
+  );
+  let results = (outs AnyTensor:$output);
+  let hasCanonicalizer = 1;
+}
+
+def Top_SoftmaxOp:Top_Op<"Softmax"> {
   let summary = "Softmax operation";
   let description = [{
     Integrates some operations related to softmax.
   }];
   let arguments = (ins
     AnyTensor:$input,
-    I64Attr:$axis,
+    SI32Attr:$axis,
     DefaultValuedAttr<BoolAttr, "false">:$log,
     DefaultValuedAttr<F64Attr, "1.0">:$beta
   );
   let results = (outs AnyTensor:$output);
 }
 
-def Top_SoftplusOp:Top_Op<"Softplus",[InOutSameShape]> {
+def Top_SoftplusOp:Top_Op<"Softplus"> {
   let summary = "Softplus operation";
   let description = [{
     y = ln(exp(x) + 1)
@@ -819,7 +964,7 @@ def Top_SoftplusOp:Top_Op<"Softplus",[InOutSameShape]> {
   let results = (outs AnyTensor:$output);
 }
 
-def Top_FloorOp:Top_Op<"Floor",[InOutSameShape]> {
+def Top_FloorOp:Top_Op<"Floor"> {
   let summary = "Floor operation";
   let description = [{
     y = floor(x)
@@ -830,7 +975,7 @@ def Top_FloorOp:Top_Op<"Floor",[InOutSameShape]> {
   let results = (outs AnyTensor:$output);
 }
 
-def Top_TopKOp:Top_Op<"TopK", [InOutSameDim]> {
+def Top_TopKOp:Top_Op<"TopK"> {
   let summary = "TopK operation";
   let description = [{
     Integrates some operations related to topk.
@@ -848,7 +993,22 @@ def Top_TopKOp:Top_Op<"TopK", [InOutSameDim]> {
   );
 }
 
-def Top_LeakyReluOp : Top_Op<"LeakyRelu", [InOutSameShape]> {
+def Top_NonZeroOp:Top_Op<"NonZero"> {
+  let summary = "NonZero operation";
+  let description = [{
+    Returns the indices of the elements that are non-zero
+    (in row-major order - by dimension).
+  }];
+  let arguments = (ins
+    AnyTensor:$input,
+    NonZeroOrderAttr:$order
+  );
+  let results = (outs
+    AnyTensor:$output
+  );
+}
+
+def Top_LeakyReluOp : Top_Op<"LeakyRelu"> {
   let summary = "LeakyRelu operation";
   let description = [{
     LeakyRelu takes input data (Tensor<T>) and an argument alpha,
@@ -857,10 +1017,10 @@ def Top_LeakyReluOp : Top_Op<"LeakyRelu", [InOutSameShape]> {
     is applied to the data tensor elementwise.
   }];
   let arguments = (ins
-    AnyTenor:$input,
+    AnyTensor:$input,
     F64Attr:$alpha
   );
-  let results = (outs AnyTenor:$output);
+  let results = (outs AnyTensor:$output);
 }
 
 def Top_UpsampleOp : Top_Op<"Upsample", [SupportFuseRelu]> {
@@ -892,7 +1052,7 @@ def Top_MaxUnpoolOp : Top_Op<"MaxUnpool"> {
   let results = (outs AnyTensor:$output);
 }
 
-def Top_LogOp: Top_Op<"Log", [InOutSameShape]> {
+def Top_LogOp: Top_Op<"Log"> {
   let summary = "Log operator";
 
   let description = [{
@@ -906,7 +1066,7 @@ def Top_LogOp: Top_Op<"Log", [InOutSameShape]> {
   let results = (outs AnyTensor:$output);
 }
 
-def Top_LRNOp: Top_Op<"LRN", [InOutSameShape]> {
+def Top_LRNOp: Top_Op<"LRN"> {
   let summary = "Local Response Normalization";
 
   let description = [{
@@ -924,7 +1084,7 @@ def Top_LRNOp: Top_Op<"LRN", [InOutSameShape]> {
   let results = (outs AnyTensor:$output);
 }
 
-def Top_ExpOp: Top_Op<"Exp", [InOutSameShape]> {
+def Top_ExpOp: Top_Op<"Exp"> {
   let summary = "Exp operator";
 
   let description = [{
@@ -938,7 +1098,77 @@ def Top_ExpOp: Top_Op<"Exp", [InOutSameShape]> {
   let results = (outs AnyTensor:$output);
 }
 
-def Top_TanhOp: Top_Op<"Tanh", [InOutSameShape]> {
+def Top_CosOp: Top_Op<"Cos"> {
+  let summary = "Cos operator";
+
+  let description = [{
+    Calculates the Cos of the given input tensor, element-wise.
+  }];
+
+  let arguments = (ins
+    AnyTensor:$input
+  );
+
+  let results = (outs AnyTensor:$output);
+}
+
+def Top_CoshOp: Top_Op<"Cosh"> {
+  let summary = "Cosh operator";
+
+  let description = [{
+    Calculates the Cosh of the giventanh input tensor, element-wise.
+  }];
+
+  let arguments = (ins
+    AnyTensor:$input
+  );
+
+  let results = (outs AnyTensor:$output);
+}
+
+def Top_SinOp: Top_Op<"Sin"> {
+  let summary = "Sin operator";
+
+  let description = [{
+    Calculates the Sin of the given input tensor, element-wise.
+  }];
+
+  let arguments = (ins
+    AnyTensor:$input
+  );
+
+  let results = (outs AnyTensor:$output);
+}
+
+def Top_SinhOp: Top_Op<"Sinh"> {
+  let summary = "Sinh operator";
+
+  let description = [{
+    Calculates the Sinh of the given input tensor, element-wise.
+  }];
+
+  let arguments = (ins
+    AnyTensor:$input
+  );
+
+  let results = (outs AnyTensor:$output);
+}
+
+def Top_TanOp: Top_Op<"Tan"> {
+  let summary = "Tan operator";
+
+  let description = [{
+    Calculates the tan of the given input tensor, element-wise.
+  }];
+
+  let arguments = (ins
+    AnyTensor:$input
+  );
+
+  let results = (outs AnyTensor:$output);
+}
+
+def Top_TanhOp: Top_Op<"Tanh"> {
   let summary = "Tanh operator";
 
   let description = [{
@@ -952,7 +1182,7 @@ def Top_TanhOp: Top_Op<"Tanh", [InOutSameShape]> {
   let results = (outs AnyTensor:$output);
 }
 
-def Top_MishOp: Top_Op<"Mish", [InOutSameShape]> {
+def Top_MishOp: Top_Op<"Mish"> {
   let summary = "Mish operator";
 
   let description = [{
@@ -966,7 +1196,7 @@ def Top_MishOp: Top_Op<"Mish", [InOutSameShape]> {
   let results = (outs AnyTensor:$output);
 }
 
-def Top_DivOp: Top_Op<"Div", [InOutSameShape]> {
+def Top_DivOp: Top_Op<"Div"> {
   let summary = "Div operator";
 
   let description = [{
@@ -1002,7 +1232,23 @@ def Top_SqueezeOp: Top_Op<"Squeeze"> {
   let results = (outs AnyTensor:$output);
 }
 
-def Top_ClipOp: Top_Op<"Clip", [InOutSameShape]> {
+def Top_UnsqueezeOp: Top_Op<"Unsqueeze"> {
+  let summary = "Unsqueeze operator";
+
+  let description = [{
+    The operator unsqueeze the input shapes by given axis.
+  }];
+
+  let arguments = (ins
+    AnyTensor:$input,
+    I64ArrayAttr:$axes
+  );
+
+  let results = (outs AnyTensor:$output);
+}
+
+
+def Top_ClipOp: Top_Op<"Clip"> {
   let summary = "Clip operator";
 
   let description = [{
@@ -1034,7 +1280,7 @@ def Top_DeconvOp: Top_Op<"Deconv", [SupportFuseRelu]> {
     I64ArrayAttr:$pads,
     DefaultValuedAttr<I64Attr, "1">:$group,
     OptionalAttr<I64ArrayAttr>:$dilations,
-    OptionalAttr<I64ArrayAttr>:$inserts,
+    OptionalAttr<I64ArrayAttr>:$output_padding,
     DefaultValuedAttr<BoolAttr, "false">:$do_relu,
     DefaultValuedAttr<F64Attr, "-1.0">:$relu_limit
   );
@@ -1045,7 +1291,7 @@ def Top_DeconvOp: Top_Op<"Deconv", [SupportFuseRelu]> {
   }];
 }
 
-def Top_ScaleOp: Top_Op<"Scale", [SupportFuseRelu, InOutSameShape]> {
+def Top_ScaleOp: Top_Op<"Scale", [SupportFuseRelu]> {
   let summary = "Scale operator";
 
   let description = [{
@@ -1135,7 +1381,7 @@ def Top_GatherOp: Top_Op<"Gather"> {
     DefaultValuedAttr<I64Attr, "0">:$axis
   );
 
-  let results = (outs AnyTenor:$output);
+  let results = (outs AnyTensor:$output);
   let hasCanonicalizer = 1;
 }
 
@@ -1151,11 +1397,26 @@ def Top_TileOp: Top_Op<"Tile"> {
     I64Attr:$tile
   );
 
-  let results = (outs AnyTenor:$output);
+  let results = (outs AnyTensor:$output);
   let hasCanonicalizer = 1;
 }
 
-def Top_AbsOp : Top_Op<"Abs", [InOutSameShape]> {
+def Top_TileExOp: Top_Op<"TileEx"> {
+  let summary = "TileEx operator";
+  let description = [{
+    Perform Tile operation on the given tensor. similar to numpy tile.
+  }];
+
+  let arguments = (ins
+    AnyTensor:$input,
+    I64ArrayAttr:$repeats
+  );
+
+  let results = (outs AnyTensor:$output);
+  let hasCanonicalizer = 1;
+}
+
+def Top_AbsOp : Top_Op<"Abs"> {
   let summary = " Abs operator";
   let description = [{
      y = abs(x)
@@ -1167,7 +1428,7 @@ def Top_AbsOp : Top_Op<"Abs", [InOutSameShape]> {
   let results = (outs AnyTensor:$output);
 }
 
-def Top_PReluOp : Top_Op<"PRelu", [InOutSameDim]> {
+def Top_PReluOp : Top_Op<"PRelu"> {
   let summary = "PRelu operator";
   let description = [{
      f(x) = slope * x   for x < 0
@@ -1177,7 +1438,7 @@ def Top_PReluOp : Top_Op<"PRelu", [InOutSameDim]> {
     AnyTensor:$input,
     AnyTensor:$slope
   );
-
+  let hasCanonicalizer = 1;
   let results = (outs AnyTensor:$output);
 }
 
@@ -1205,7 +1466,7 @@ def Top_ReduceOp : Top_Op<"Reduce"> {
   let arguments = (ins
     AnyTensor:$input,
     I64ArrayAttr:$axes,
-    I64Attr:$keepdims,
+    BoolAttr:$keepdims,
     ReduceModeAttr:$mode
   );
   let results = (outs AnyTensor:$output);
@@ -1220,7 +1481,7 @@ def Top_ArgOp : Top_Op<"Arg"> {
   let arguments = (ins
     AnyTensor:$input,
     I64Attr:$axis,
-    I64Attr:$keepdims,
+    BoolAttr:$keepdims,
     ArgModeAttr:$mode
   );
   let results = (outs
@@ -1230,7 +1491,7 @@ def Top_ArgOp : Top_Op<"Arg"> {
   let hasCanonicalizer = 1;
 }
 
-def Top_PowOp : Top_Op<"Pow", [InOutSameShape]> {
+def Top_PowOp : Top_Op<"Pow"> {
   let summary = "Pow operation";
   let description = [{
     output = input ^ n
@@ -1242,7 +1503,7 @@ def Top_PowOp : Top_Op<"Pow", [InOutSameShape]> {
   let results = (outs AnyTensor:$output);
 }
 
-def Top_SqrtOp : Top_Op<"Sqrt", [InOutSameShape]> {
+def Top_SqrtOp : Top_Op<"Sqrt"> {
   let summary = "Sqrt operation";
   let description = [{
     Computes the square root of the input tensor's element.
@@ -1260,8 +1521,12 @@ def Top_WhereOp : Top_Op<"Where"> {
   }];
   let arguments = (ins
     AnyTensor:$cond,
-    AnyTensor:$tbrn,
-    AnyTensor:$fbrn
+    AnyTensorOrNone:$tbrn,
+    AnyTensorOrNone:$fbrn,
+    DefaultValuedAttr<BoolAttr, "false">:$x_is_const,
+    DefaultValuedAttr<BoolAttr, "false">:$y_is_const,
+    DefaultValuedAttr<F64Attr, "0.0">:$x_const_val,
+    DefaultValuedAttr<F64Attr, "0.0">:$y_const_val
   );
   let results = (outs AnyTensor:$output);
 }
@@ -1377,13 +1642,15 @@ def Top_DetectionOutputOp : Top_Op<"DetectionOutput"> {
   let arguments = (ins
     Variadic<AnyTensor>:$inputs,
     I64Attr:$num_classes,
-    I64Attr:$background_label_id,
+    DefaultValuedAttr<I64Attr, "0">:$background_label_id,
     F64Attr:$nms_threshold,
     I64Attr:$top_k,
     DetectionOutputCodeTypeAttr:$code_type,
     I64Attr:$keep_top_k,
     F64Attr:$confidence_threshold,
-    DefaultValuedAttr<BoolAttr, "true">:$share_location
+    DefaultValuedAttr<BoolAttr, "true">:$share_location,
+    DefaultValuedAttr<F64Attr, "0">:$variance_encoded_in_target,
+    DefaultValuedAttr<F64Attr, "1">:$eta
   );
   let results = (outs AnyTensor:$output);
 }
@@ -1408,14 +1675,14 @@ def Top_YoloDetectionOp : Top_Op<"YoloDetection"> {
     DefaultValuedAttr<I64Attr, "0">:$flag,
     DefaultValuedAttr<I64Attr, "3">:$num_boxes,
     DefaultValuedAttr<I64Attr, "3">:$mask_group_size,
-    DefaultValuedAttr<ConfinedAttr<I64ArrayAttr, [ArrayCount<3>]>, "0">:$scale,
-    DefaultValuedAttr<ConfinedAttr<I64ArrayAttr, [ArrayCount<9>]>, "0">:$mask
+    DefaultValuedAttr<ConfinedAttr<I64ArrayAttr, [ArrayCount<3>]>, "{0,0,0}">:$scale,
+    DefaultValuedAttr<ConfinedAttr<I64ArrayAttr, [ArrayCount<9>]>, "{0,0,0,0,0,0,0,0,0}">:$mask
   );
 
   let results = (outs AnyTensor:$output);
 }
 
-def Top_QuantizeLinearOp : Top_Op<"QuantizeLinear", [InOutSameShape]> {
+def Top_QuantizeLinearOp : Top_Op<"QuantizeLinear"> {
   let summary = "Linear quantize operation";
   let description = [{
     QuantizeLinear(x) := saturate ((x / y_scale) + y_zero_point)
@@ -1440,13 +1707,47 @@ def Top_LayerNormOp : Top_Op<"LayerNorm"> {
     AnyTensor:$input,
     AnyTensorOrNone:$weight,
     AnyTensorOrNone:$bias,
-    I64Attr:$axis,
+    I64ArrayAttr:$normalized_shape,
+    SI32Attr:$axis,
     F64Attr:$eps
   );
   let results = (outs
   	AnyTensor:$output,
   	AnyTensorOrNone:$mean,
   	AnyTensorOrNone:$rstd
+  );
+}
+
+def Top_InstanceNormOp : Top_Op<"InstanceNorm"> {
+  let summary = "Instance Norm operation";
+  let description = [{
+    instance normalization
+  }];
+  let arguments = (ins
+    AnyTensor:$input,
+    AnyTensorOrNone:$weight,
+    AnyTensorOrNone:$bias,
+    F64Attr:$eps
+  );
+  let results = (outs
+  	AnyTensor:$output
+  );
+}
+
+def Top_GroupNormOp : Top_Op<"GroupNorm"> {
+  let summary = "GroupNorm operation";
+  let description = [{
+    group normalization
+  }];
+  let arguments = (ins
+    AnyTensor:$input,
+    AnyTensorOrNone:$weight,
+    AnyTensorOrNone:$bias,
+    I64Attr:$num_groups,
+    F64Attr:$eps
+  );
+  let results = (outs
+  	AnyTensor:$output
   );
 }
 
@@ -1530,7 +1831,7 @@ def Top_ROIPoolingOp : Top_Op<"ROIPooling">  {
 }
 
 
-def Top_DequantizeLinearOp : Top_Op<"DequantizeLinear", [InOutSameShape]> {
+def Top_DequantizeLinearOp : Top_Op<"DequantizeLinear"> {
   let summary = "Linear dequantize operation";
   let description = [{
     DequantizeLinear(x) := (x - x_zero_point) * x_scale
@@ -1619,7 +1920,7 @@ def Top_CscOp: Top_Op<"Csc"> {
   let results = (outs AnyTensor:$output);
 }
 
-def Top_ScaleLutOp: Top_Op<"ScaleLut", [InOutSameShape]> {
+def Top_ScaleLutOp: Top_Op<"ScaleLut"> {
   let summary = "Scale by lut operator";
 
   let description = [{
@@ -1631,6 +1932,7 @@ def Top_ScaleLutOp: Top_Op<"ScaleLut", [InOutSameShape]> {
     Attributes:
       `scale`   : each channel scale
       `bias`    : each channel bias
+      `sign`    : if output is signed
 
 
     Result:
@@ -1641,13 +1943,14 @@ def Top_ScaleLutOp: Top_Op<"ScaleLut", [InOutSameShape]> {
   let arguments = (
     ins AnyTensor:$input,
     F64ArrayAttr:$scale,
-    F64ArrayAttr:$bias
+    F64ArrayAttr:$bias,
+    DefaultValuedAttr<BoolAttr, "true">:$sign
   );
 
   let results = (outs AnyTensor:$output);
 }
 
-def Top_SwapChannelOp: Top_Op<"SwapChannel", [InOutSameShape]> {
+def Top_SwapChannelOp: Top_Op<"SwapChannel"> {
   let summary = "swap channel operator, normally RGB <=> BGR";
 
   let description = [{
@@ -1675,7 +1978,7 @@ def Top_SwapChannelOp: Top_Op<"SwapChannel", [InOutSameShape]> {
   let results = (outs AnyTensor:$output);
 }
 
-def Top_SwapDimInnerOp: Top_Op<"SwapDimInner", [InOutSameShape]> {
+def Top_SwapDimInnerOp: Top_Op<"SwapDimInner"> {
   let summary = "if offset is not 0, split there and swap first part and second part of it";
 
   let description = [{
@@ -1688,6 +1991,40 @@ def Top_SwapDimInnerOp: Top_Op<"SwapDimInner", [InOutSameShape]> {
 
   let results = (outs AnyTensor:$output);
   let hasCanonicalizer = 1;
+}
+
+def Top_ScatterElementsOp: Top_Op<"ScatterElements"> {
+  let summary = "ScatterElements op";
+  let description = [{
+    ScatterElements takes three inputs data, updates, and indices
+    of the same rank r >= 1 and an optional attribute axis that
+    identifies an axis of data (by default, the outer-most axis,
+    that is axis 0). The output of the operation is produced by
+    creating a copy of the input data, and then updating its
+    value to values specified by updates at specific index
+    positions specified by indices. Its output shape is the
+    same as the shape of data.
+
+    Inputs:
+      `input`       : Tensor of rank r >= 1.
+      `indices`     : Tensor of int32/int64 indices, of r >= 1 (same rank
+                      as input). All index values are expected to be within
+                      bounds [-s, s-1] along axis of size s. It is an error
+                      if any of the index values are out of bounds..
+      `updates`     : Tensor of rank r >=1 (same rank and shape as indices).
+
+    Outputs:
+      `output`      : Tensor of rank r >= 1 (same rank as input).
+  }];
+
+  let arguments = (ins
+    AnyTensor:$input,
+    AnyTensor:$indices,
+    AnyTensor:$updates,
+    I64Attr:$axis
+  );
+
+  let results = (outs AnyTensor:$output);
 }
 
 def Top_ScatterNDOp: Top_Op<"ScatterND"> {
@@ -1712,10 +2049,10 @@ def Top_ScatterNDOp: Top_Op<"ScatterND"> {
     AnyTensor:$updates
   );
 
-  let results = (outs AnyTenor:$output);
+  let results = (outs AnyTensor:$output);
 }
 
-def Top_RoiAlignOp: Top_Op<"RoiAlign", [InOutSameDim]> {
+def Top_RoiAlignOp: Top_Op<"RoiAlign"> {
   let summary = "RoiAlign operator";
   let description = [{
     RoiAlign consumes an input tensor X and region of interests
@@ -1745,11 +2082,11 @@ def Top_RoiAlignOp: Top_Op<"RoiAlign", [InOutSameDim]> {
     BoolAttr:$align_corners
   );
 
-  let results = (outs AnyTenor:$output);
+  let results = (outs AnyTensor:$output);
 }
 
 def Top_PreprocessOp: Top_Op<"Preprocess"> {
-  let summary = "FusePreprcess for cv18xx chip, it's just a placeholder op.";
+  let summary = "FusePreprcess, it's just a placeholder op.";
   let description = [{
     It may be divided to permute + slice + scale/scale_lut ops.
   }];
@@ -1760,7 +2097,8 @@ def Top_PreprocessOp: Top_Op<"Preprocess"> {
     StrAttr:$channel_order,
     I64ArrayAttr:$resize_dims,
     F64ArrayAttr:$scale,
-    F64ArrayAttr:$mean
+    F64ArrayAttr:$mean,
+    DefaultValuedAttr<BoolAttr, "true">:$sign
   );
   let results = (outs AnyTensor:$output);
 }
@@ -1788,7 +2126,7 @@ def Top_RetinaFaceDetectionOp : Top_Op<"RetinaFaceDetection"> {
   let results = (outs AnyTensor:$output);
 }
 
-def Top_EluOp : Top_Op<"Elu", [InOutSameShape]> {
+def Top_EluOp : Top_Op<"Elu"> {
   let summary = "Elu operation";
   let description = [{
     Elu takes input data (Tensor<T>) and an argument alpha,
@@ -1797,9 +2135,9 @@ def Top_EluOp : Top_Op<"Elu", [InOutSameShape]> {
     is applied to the data tensor elementwise.
   }];
   let arguments = (ins
-    AnyTenor:$input,
+    AnyTensor:$input,
     F64Attr:$alpha
   );
-  let results = (outs AnyTenor:$output);
+  let results = (outs AnyTensor:$output);
 }
 #endif // Top_OPS

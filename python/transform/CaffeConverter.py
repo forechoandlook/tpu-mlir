@@ -113,7 +113,6 @@ class CaffeConverter(BaseConverter):
             'MatMul': lambda layer: self.convert_matmul_op(layer),
         }
 
-
     def __del__(self):
         if self.mlir != None:
             del self.mlir
@@ -426,6 +425,7 @@ class CaffeConverter(BaseConverter):
                 self.addOperand(layer.top[1], mask_op)
                 return
         elif method == 1:  # AVE
+            attrs['keepdims'] = len(output_shape) == len(input_shape)
             new_op = self.mlir.create_avgpool_op([op], output_shape, **attrs)
             self.addOperand(layer.top[0], new_op)
             return
@@ -646,7 +646,6 @@ class CaffeConverter(BaseConverter):
             'pads': padding * dim,
             'group': g,
             'do_relu': False,
-            'ins': [],
         }
         output_shape = self.getShape(layer.top[0])
         new_op = self.mlir.create_conv_transpose_op([in_op, filter_op, bias_op], output_shape,
@@ -732,7 +731,7 @@ class CaffeConverter(BaseConverter):
         p = layer.interp_param
 
         assert (len(input_shape) == 4 and "current only support 4 dims")
-        assert ((p.pad_beg >= 0 and p.pad_end >= 0) and "pad only support positive")
+        assert ((p.pad_beg == 0 and p.pad_end == 0) and "only support pad")
 
         # append pad
         after_h = input_shape[2] + p.pad_beg + p.pad_end
@@ -794,8 +793,8 @@ class CaffeConverter(BaseConverter):
             'shrink_factor': p.shrink_factor,
             'width': p.width,
             'zoom_factor': p.zoom_factor,
-            'scale_h': float(output_shape[2]) / input_shape[2],
-            'scale_w': float(output_shape[3]) / input_shape[3],
+            'scale_h': float(input_shape[2] - 1) / (output_shape[2] - 1),
+            'scale_w': float(input_shape[3] - 1) / (output_shape[3] - 1),
             'coordinate_transformation_mode': 'align_corners',
             'mode': 'linear',
         }
@@ -864,7 +863,7 @@ class CaffeConverter(BaseConverter):
             "batch_first": bool(False),
         }
         out_shape = [seq_length, 1, batch_size, hidden_size]
-        out_shapes = [out_shape, [], []]
+        out_shapes = [out_shape, None, None]
         new_op, _, _ = self.mlir.create_lstm_op(operands, out_shapes, **param)
         # reshape back
         attrs = {'name': name}
@@ -918,7 +917,7 @@ class CaffeConverter(BaseConverter):
             "batch_first": bool(False),
         }
         out_shape = [seq_length, 1, batch_size, hidden_size]
-        out_shapes = [out_shape, [], []]
+        out_shapes = [out_shape, None, None]
         new_op, _, _ = self.mlir.create_lstm_op(operands, out_shapes, **param)
         # reshape back
         attrs = {'name': name}

@@ -10,10 +10,11 @@
 #include "tpu_mlir/Dialect/Tpu/IR/TpuOps.h"
 #include "tpu_mlir/Support/Dnnl/Dnnl.h"
 
-#include "tpu_mlir/Support/Module.h"
+#include "tpu_mlir/Support/Float16.h"
+#include "tpu_mlir/Support/GenericCpuFunc.h"
 #include "tpu_mlir/Support/LutFunc.h"
 #include "tpu_mlir/Support/MathUtils.h"
-#include "tpu_mlir/Support/Float16.h"
+#include "tpu_mlir/Support/Module.h"
 
 static mlir::Type t;
 
@@ -59,9 +60,8 @@ LogicalResult tpu::ActiveOp::inference(InferenceParameter &p) {
   case ActiveMode::ELU: {
     const auto coeffs_ = module::getF64Array(getCoeffs(), 1, 0);
     const double alpha = coeffs_->at(0);
-    active_func(p, num_element, [alpha](double val) {
-      return elu(val, alpha);
-    });
+    active_func(p, num_element,
+                [alpha](double val) { return elu(val, alpha); });
     break;
   }
   case ActiveMode::ERF:
@@ -84,6 +84,10 @@ LogicalResult tpu::ActiveOp::inference(InferenceParameter &p) {
     active_func(p, num_element,
                 [](double val) { return 1 / (1 + std::exp(-val)); });
     break;
+  case ActiveMode::LOG_SIGMOID:
+    active_func(p, num_element,
+                [](double val) { return std::log(1 / (1 + std::exp(-val))); });
+    break;
   case ActiveMode::HSIGMOID: {
     const auto coeffs_ = module::getF64Array(getCoeffs(), 2, 0);
     const double alpha = coeffs_->at(1);
@@ -95,6 +99,9 @@ LogicalResult tpu::ActiveOp::inference(InferenceParameter &p) {
   }
   case ActiveMode::HSWISH:
     active_func(p, num_element, [](double val) { return hswish(val); });
+    break;
+  case ActiveMode::TAN:
+    active_func(p, num_element, [](double val) { return std::tan(val); });
     break;
   case ActiveMode::TANH:
     active_func(p, num_element, [](double val) { return std::tanh(val); });
@@ -108,6 +115,25 @@ LogicalResult tpu::ActiveOp::inference(InferenceParameter &p) {
     break;
   case ActiveMode::FLOOR:
     active_func(p, num_element, [](double val) { return std::floor(val); });
+    break;
+  case ActiveMode::SOFT_SIGN:
+    active_func(p, num_element,
+                [](double val) { return val / (1 + std::abs(val)); });
+    break;
+  case ActiveMode::MISH:
+    active_func(p, num_element, activate_f(my_mish_activate));
+    break;
+  case ActiveMode::COS:
+    active_func(p, num_element, [](double val) { return std::cos(val); });
+    break;
+  case ActiveMode::COSH:
+    active_func(p, num_element, [](double val) { return std::cosh(val); });
+    break;
+  case ActiveMode::SIN:
+    active_func(p, num_element, [](double val) { return std::sin(val); });
+    break;
+  case ActiveMode::SINH:
+    active_func(p, num_element, [](double val) { return std::sinh(val); });
     break;
   default:
     llvm_unreachable("Not Implemented");
