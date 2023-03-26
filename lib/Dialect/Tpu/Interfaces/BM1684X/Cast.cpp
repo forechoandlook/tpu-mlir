@@ -9,6 +9,7 @@
 
 #include "tpu_mlir/Backend/BM168x/BM1684X.h"
 #include "tpu_mlir/Dialect/Tpu/IR/TpuOps.h"
+#include "tpu_mlir/Dialect/Tpu/Transforms/BM168x/DynCompileCommon.hpp"
 #include "tpu_mlir/Support/Module.h"
 
 using namespace tpu_mlir::backend;
@@ -95,8 +96,8 @@ int64_t tpu::CastOp::getBufferSize_bm1684x(int64_t in_lmem_bytes,
 void tpu::CastOp::codegen_local_bm1684x(int64_t n_step, int64_t h_step,
                                         group_type_t group_type,
                                         local_sec_info_t &sec_info) {
-  int64_t n, c, h, w;
-  module::getNCHW(getInput(), n, c, h, w, group_type);
+  int64_t n, c, d, h, w;
+  module::getNCDHW(getInput(), n, c, d, h, w, group_type);
   auto op = getOperation();
   bool qInput = module::isUniformQuantized(getInput());
   bool qOutput = module::isUniformQuantized(getOutput());
@@ -123,7 +124,7 @@ void tpu::CastOp::codegen_local_bm1684x(int64_t n_step, int64_t h_step,
       param.output_addr = gi.out_addr;
       param.requant_addr = 0;
       param.buffer_local_addr = buffer_addr;
-      param.n = sec_info.out_n_slice;
+      param.n = sec_info.out_n_slice * d;
       param.c = c;
       param.h = sec_info.out_h_slice;
       param.w = sec_info.out_w_slice;
@@ -141,7 +142,7 @@ void tpu::CastOp::codegen_local_bm1684x(int64_t n_step, int64_t h_step,
       param.input_addr = in_gi.out_addr;
       param.output_addr = gi.out_addr;
       param.dequant_addr = 0;
-      param.n = sec_info.out_n_slice;
+      param.n = sec_info.out_n_slice * d;
       param.c = c;
       param.h = sec_info.out_h_slice;
       param.w = sec_info.out_w_slice;
@@ -245,5 +246,18 @@ int64_t tpu::CastOp::dyn_codegen_global_bm1684x(void *buffer) {
       param.output_dtype = BM168x::getDataType(getOutput());
       return BM168x::dynamic_spec_to_buffer(buffer, param);
     }
+  }
+}
+
+int64_t tpu::CastOp::get_fw_type_bm1684x() {
+  bool qInput = module::isUniformQuantized(getInput());
+  bool qOutput = module::isUniformQuantized(getOutput());
+  if (!qInput && !qOutput)
+    return FW_BMNET_DTYPE_CONVERT;
+  else {
+    if (!qInput && qOutput)
+      return FW_BMNET_REQUANT_FP32;
+    else
+      return FW_BMNET_DEQUANT_FP32;
   }
 }

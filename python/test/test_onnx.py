@@ -7,7 +7,6 @@
 # ==============================================================================
 
 from copy import deepcopy
-from re import T
 import numpy as np
 import onnx
 from onnx import helper
@@ -15,6 +14,7 @@ from onnx import TensorProto
 from tools.model_runner import mlir_inference, model_inference, onnx_inference, show_fake_cmd
 from tools.npz_tool import npz_compare
 from tools.model_transform import *
+from utils.auto_remove import file_mark, file_clean
 from utils.mlir_shell import *
 import os
 import torch
@@ -24,176 +24,202 @@ import torchvision
 import onnxruntime
 import multiprocessing
 
-BM1684X_Failed_Cases = ["QDQ", "QDQConv", "TorchArgmax", "TorchActivation", "TorchChannelShuffle"]
-CV18XX_Failed_Cases = [
-    "Conv3d", "Compare", "CompareConst", "Erf", "GRU3", "LeakyRelu", "LogSoftmax", "Reshape",
-    "ReshapeFuse", "PadEdge", "ScatterND", "Sqrt", "Sub2", "Where", "TopK", "TorchGelu", "TorchGRU",
-    "TorchLayerNorm", "TorchLogSoftmax", "Transpose2", "TorchMaskedFill", "TorchWhere", "TorchStd",
-    "QDQ", "QDQConv", "PermuteFuse", "SwapDimInner", "ChannelNorm", "TorchActivation",
-    "TorchArgmax", "TorchChannelShuffle"
-]
-
 
 class ONNX_IR_TESTER(object):
     # This class is built for testing single operator transform.
-    def __init__(self, chip: str = "bm1684x", mode: str = "all", dynamic: bool = True):
-        self.test_function = {
-            #############################
+    def __init__(self,
+                 chip: str = "bm1684x",
+                 mode: str = "all",
+                 dynamic: bool = True,
+                 simple: bool = False):
+        Y, N = True, False
+        # yapf: disable
+        self.test_cases = {
+            #########################################
             # ONNX Test Case, Alphabetically
-            #############################
-            "Abs": self.test_Abs,
-            "Add": self.test_Add,
-            "Arg": self.test_Arg,
-            "AddConst": self.test_AddConst,
-            "AvgPool1d": self.test_AvgPool1d,
-            "AvgPool2d": self.test_AvgPool2d,
-            # "AvgPool3d": self.test_AvgPool3d,
-            "AvgPoolOdd": self.test_AvgPoolOdd,
-            "PadAvgPool2d": self.test_PadAvgPool2d,
-            "BatchMatMul": self.test_BatchMatMul,
-            "BroadcastAdd": self.test_BroadcastAdd,
-            "BroadcastMul": self.test_BroadcastMul,
-            "BroadcastMulConst": self.test_BroadcastMulConst,
-            "CompareConst": self.test_CompareConst,
-            "Compare": self.test_Compare,
-            # "Compare2": self.test_Compare2,
-            "Concat": self.test_Concat,
-            "Concat2": self.test_Concat2,
-            "Conv1d": self.test_Conv1d,
-            "Conv2d": self.test_Conv2d,
-            "Conv3d": self.test_Conv3d,
-            "ConvStride": self.test_ConvStride,
-            "ConvDw": self.test_ConvDw,
-            "ConvTranspose": self.test_ConvTranspose,
-            "ConvTranspose2": self.test_ConvTranspose2,  #no pad
-            "Clip": self.test_Clip,
-            "DepthToSpace": self.test_DepthToSpace,
-            "Div": self.test_Div,
-            "Elu": self.test_Elu,
-            "Erf": self.test_Erf,
-            "Exp": self.test_Exp,
-            "Expand": self.test_Expand,
-            "Expand2": self.test_Expand2,
-            "Floor": self.test_floor,
-            "Gather": self.test_Gather,
-            "GatherToSlice": self.test_GatherToSlice,
-            "Gemm": self.test_Gemm,
-            "GroupFC": self.test_GroupFC,
-            "GRU": self.test_GRU,  # test gru output Y
-            "GRU2": self.test_GRU2,  # test gru output Yh
-            "GRU3": self.test_GRU3,  # test gru output Y and Yh
-            # "LayerNorm": self.test_LayerNorm,
-            "LeakyRelu": self.test_LeakyRelu,
-            "Log": self.test_Log,
-            "LogSoftmax": self.test_LogSoftmax,
-            "LRN": self.test_LRN,
-            "LSTM": self.test_LSTM,  # output_y
-            "LSTM2": self.test_LSTM2,  # output all
-            "LSTM3": self.test_LSTM3,  # output_yh and output_yc
-            "MaxPool1d": self.test_MaxPool1d,
-            "MaxPool2d": self.test_MaxPool2d,
-            # "MaxPool3d": self.test_MaxPool3d,
-            "MatMul": self.test_MatMul,
-            "MatMul2": self.test_MatMul2,
-            "Max": self.test_Max,
-            "Mul": self.test_Mul,
-            "Min": self.test_Min,
-            "MulConst": self.test_MulConst,
-            "Neg": self.test_Neg,
-            "Pad": self.test_Pad,  # zero pad
-            "Pad1": self.test_Pad1,  # pad val
-            "PadEdge": self.test_PadEdge,
-            "PadReflect": self.test_PadReflect,
-            "Pow1": self.test_Pow1,  # y = x ^ n
-            #"Pow2": self.test_Pow2, # y = n ^ x
-            "PRelu": self.test_PRelu,
-            "QDQConv": self.test_QDQConv,
-            "QDQ": self.test_QDQ,
-            "Resize": self.test_Resize,
-            "Resize2": self.test_Resize2,
-            "Reshape": self.test_Reshape,
-            "Reduce": self.test_Reduce,
-            "Reduce2": self.test_Reduce2,
-            "ReduceL2": self.test_ReduceL2,
-            "ReduceMean": self.test_ReduceMean,
-            "ReduceSum": self.test_ReduceSum,
-            "ReduceProd": self.test_ReduceProd,
-            "Reciprocal": self.test_Reciprocal,
-            "Relu": self.test_Relu,
-            "ScatterND": self.test_ScatterND,
-            "SiLU": self.test_SiLU,
-            "Softmax": self.test_Softmax,
-            "Softplus": self.test_Softplus,
-            "Squeeze": self.test_Squeeze,
-            "Sigmoid": self.test_Sigmoid,
-            "Slice": self.test_Slice,
-            "Split": self.test_Split,
-            "Scale": self.test_Scale,
-            "Sqrt": self.test_Sqrt,
-            "Sub": self.test_Sub,
-            "Sub2": self.test_Sub2,
-            "SubConst": self.test_SubConst,
-            "SubConst2": self.test_SubConst2,
-            "Sum": self.test_Sum,
-            "Tanh": self.test_Tanh,
-            "Tile": self.test_Tile,
-            "Transpose": self.test_Transpose,
-            "Transpose2": self.test_Transpose2,
-            "TopK": self.test_TopK,
-            "Where": self.test_Where,
-            #############################
+            #########################################
+            # case: (test, bm1684x_support, bm1686_support, cv183x_support)
+            "Abs":          (self.test_Abs,         Y, N, Y),
+            "Add":          (self.test_Add,         Y, N, Y),
+            "AddBcast":     (self.test_AddBcast,    Y, N, N),
+            "AddBcast2":    (self.test_AddBcast2,   Y, N, N),
+            "AddBcast3":    (self.test_AddBcast3,   N, N, N),  # failed cases
+            "Arg":          (self.test_Arg,         Y, N, N),
+            "AddConst":     (self.test_AddConst,    Y, N, Y),
+            "AvgPool1d":    (self.test_AvgPool1d,   Y, N, Y),
+            "AvgPool2d":    (self.test_AvgPool2d,   Y, N, Y),
+            "AvgPool3d":    (self.test_AvgPool3d,   Y, N, Y),
+            "AvgPoolOdd":   (self.test_AvgPoolOdd,  Y, N, Y),
+            "PadAvgPool2d": (self.test_PadAvgPool2d,Y, N, Y),
+            "BatchMatMul":  (self.test_BatchMatMul, Y, N, Y),
+            "BCastAdd":     (self.test_BCastAdd,    Y, N, Y),
+            "BCastMul":     (self.test_BCastMul,    Y, N, Y),
+            "BCastMulCst":  (self.test_BCastMulCst, Y, N, Y),
+            "CompareCst":   (self.test_CompareCst,  Y, N, N),
+            "Compare":      (self.test_Compare,     Y, N, N),
+            "Compare2":     (self.test_Compare2,    N, N, N),
+            "Concat":       (self.test_Concat,      Y, N, Y),
+            "Concat2":      (self.test_Concat2,     Y, N, Y),
+            "Conv1d":       (self.test_Conv1d,      Y, N, Y),
+            "Conv2d":       (self.test_Conv2d,      Y, N, Y),
+            "Conv3d":       (self.test_Conv3d,      Y, N, Y),
+            "ConvStride":   (self.test_ConvStride,  Y, N, Y),
+            "ConvDw":       (self.test_ConvDw,      Y, N, Y),
+            "ConvTrans":    (self.test_ConvTrans,   Y, N, Y),
+            "ConvTrans2":   (self.test_ConvTrans2,  Y, N, Y),  #no pad
+            "Clip":         (self.test_Clip,        Y, N, Y),
+            "DepthToSpace": (self.test_DepthToSpace,Y, N, Y),
+            "Div":          (self.test_Div,         Y, N, Y),
+            "DivBcast":     (self.test_DivBcast,    Y, N, N),
+            "DivBcast2":    (self.test_DivBcast2,   Y, N, N),
+            "Elu":          (self.test_Elu,         Y, N, N),
+            "Erf":          (self.test_Erf,         Y, N, N),
+            "Exp":          (self.test_Exp,         Y, N, Y),
+            "Expand":       (self.test_Expand,      Y, N, Y),
+            "Expand2":      (self.test_Expand2,     Y, N, Y),
+            "Floor":        (self.test_floor,       Y, N, N),
+            "Gather":       (self.test_Gather,      Y, N, Y),
+            "Gemm":         (self.test_Gemm,        Y, N, Y),
+            "GroupFC":      (self.test_GroupFC,     Y, N, Y),
+            "GRU":          (self.test_GRU,         Y, N, Y),  # test gru output Y
+            "GRU2":         (self.test_GRU2,        Y, N, Y),  # test gru output Yh
+            "GRU3":         (self.test_GRU3,        Y, N, Y),  # test gru output Y and Yh
+            "LeakyRelu":    (self.test_LeakyRelu,   Y, N, Y),
+            "Log":          (self.test_Log,         Y, N, Y),
+            "LogSoftmax":   (self.test_LogSoftmax,  Y, N, Y),
+            "LRN":          (self.test_LRN,         Y, N, Y),
+            "LSTM":         (self.test_LSTM,        Y, N, Y),  # output_y
+            "LSTM2":        (self.test_LSTM2,       Y, N, Y),  # output all
+            "LSTM3":        (self.test_LSTM3,       Y, N, Y),  # output_yh and output_yc
+            "MaxPool1d":    (self.test_MaxPool1d,   Y, N, Y),
+            "MaxPool2d":    (self.test_MaxPool2d,   Y, N, Y),
+            "MaxPool3d":    (self.test_MaxPool3d,   N, N, Y),
+            "MatMul":       (self.test_MatMul,      Y, N, Y),
+            "MatMul2":      (self.test_MatMul2,     Y, N, Y),
+            "Max":          (self.test_Max,         Y, N, Y),
+            "MaxBcast":     (self.test_MaxBcast,    Y, N, N),
+            "Mul":          (self.test_Mul,         Y, N, Y),
+            "MulBcast":     (self.test_MulBcast,    Y, N, N),
+            "MulBcast2":    (self.test_MulBcast2,   Y, N, N),
+            "Min":          (self.test_Min,         Y, N, Y),
+            "MinBcast":     (self.test_MinBcast,    Y, N, N),
+            "MulConst":     (self.test_MulConst,    Y, N, Y),
+            "Neg":          (self.test_Neg,         Y, N, Y),
+            "Pad":          (self.test_Pad,         Y, N, Y),  # zero pad
+            "Pad1":         (self.test_Pad1,        Y, N, Y),  # pad val
+            "PadEdge":      (self.test_PadEdge,     Y, N, Y),
+            "PadReflect":   (self.test_PadReflect,  Y, N, Y),
+            "Pow1":         (self.test_Pow1,        Y, N, Y),  # y = x ^ n
+            "Pow2":         (self.test_Pow2,        N, N, N),  # y = n ^ x
+            "PRelu":        (self.test_PRelu,       Y, N, Y),
+            "QDQConv":      (self.test_QDQConv,     N, N, N),
+            "QDQ":          (self.test_QDQ,         N, N, N),
+            "Resize":       (self.test_Resize,      Y, N, Y),
+            "Resize2":      (self.test_Resize2,     Y, N, Y),
+            "Reshape":      (self.test_Reshape,     Y, N, N),
+            "Reduce":       (self.test_Reduce,      Y, N, Y),
+            "Reduce2":      (self.test_Reduce2,     Y, N, Y),
+            "ReduceL2":     (self.test_ReduceL2,    Y, N, Y),
+            "ReduceMean":   (self.test_ReduceMean,  Y, N, Y),
+            "ReduceSum":    (self.test_ReduceSum,   Y, N, Y),
+            "ReduceProd":   (self.test_ReduceProd,  Y, N, N),
+            "Reciprocal":   (self.test_Reciprocal,  Y, N, Y),
+            "Relu":         (self.test_Relu,        Y, N, Y),
+            "ScatterND":    (self.test_ScatterND,   Y, N, N),
+            "SiLU":         (self.test_SiLU,        Y, N, Y),
+            "Softmax":      (self.test_Softmax,     Y, N, Y),
+            "Softplus":     (self.test_Softplus,    Y, N, Y),
+            "Squeeze":      (self.test_Squeeze,     Y, N, Y),
+            "Sigmoid":      (self.test_Sigmoid,     Y, N, Y),
+            "Slice":        (self.test_Slice,       Y, N, Y),
+            "Slice2":       (self.test_Slice2,      Y, N, Y),
+            "Slice3":       (self.test_Slice3,      Y, N, Y),
+            "Split":        (self.test_Split,       Y, N, Y),
+            "Scale":        (self.test_Scale,       Y, N, Y),
+            "Sqrt":         (self.test_Sqrt,        Y, N, Y),
+            "Sub":          (self.test_Sub,         Y, N, Y),
+            "Sub2":         (self.test_Sub2,        Y, N, Y),
+            "SubBcast":     (self.test_SubBcast,    Y, N, N),
+            "SubBcast2":    (self.test_SubBcast2,   Y, N, N),
+            "SubConst":     (self.test_SubConst,    Y, N, N),
+            "SubConst2":    (self.test_SubConst2,   Y, N, Y),
+            "Sum":          (self.test_Sum,         Y, N, Y),
+            "Tanh":         (self.test_Tanh,        Y, N, Y),
+            "Tile":         (self.test_Tile,        Y, N, Y),
+            "Transpose":    (self.test_Transpose,   Y, N, Y),
+            "Transpose2":   (self.test_Transpose2,  Y, N, Y),
+            "TopK":         (self.test_TopK,        Y, N, N),
+            "Where":        (self.test_Where,       Y, N, Y),
+            #####################################
             # Torch Test Case, Alphabetically
-            #############################
-            "TorchActivation": self.test_TorchActivation,
-            "TorchArgmax": self.test_TorchArgmax,
-            "TorchChannelShuffle": self.test_TorchChannelShuffle,
-            "TorchChunk": self.test_TorchChunk,
-            "TorchConv3dTranspose": self.test_TorchConv3dTranspose,
-            "TorchHardSwish": self.test_TorchHardSwish,
-            "TorchHardSigmoid": self.test_TorchHardSigmoid,
-            "TorchIdentity": self.test_TorchIdentity,
-            "TorchGelu": self.test_TorchGelu,
-            "TorchGRU": self.test_TorchGRU,
-            "TorchLayerGroup": self.test_TorchLayerGroup,
-            "TorchLayerNorm": self.test_TorchLayerNorm,
-            "TorchLayerNorm2": self.test_TorchLayerNorm2,
-            "TorchLogSoftmax": self.test_TorchLogSoftmax,
-            "TorchLSTM": self.test_TorchLSTM,
-            "TorchMaskedFill": self.test_TorchMaskedFill,
-            "TorchReflectionPad": self.test_TorchReflectionPad,
-            "TorchRoiAlign": self.test_TorchRoiAlign,
-            "TorchSize": self.test_TorchSize,
-            "TorchStd": self.test_TorchStd,
-            "TorchWhere": self.test_TorchWhere,
-            "TorchZeroPad": self.test_TorchZeroPad,
-            #############################
+            #####################################
+            # case: (test, bm1684x_support, bm1686_support, cv183x_support)
+            "TorchActivation":      (self.test_TorchActivation,     N, N, Y),
+            "TorchArgmax":          (self.test_TorchArgmax,         N, N, N),
+            "TorchChannelShuffle":  (self.test_TorchChannelShuffle, N, N, N),
+            "TorchChunk":           (self.test_TorchChunk,          Y, N, Y),
+            "TorchConv2d":          (self.test_TorchConv2d,           N, N, Y),
+            "TorchConv3dTrans":     (self.test_TorchConv3dTrans,    Y, N, Y),
+            "TorchHardSwish":       (self.test_TorchHardSwish,      Y, N, Y),
+            "TorchHardSigmoid":     (self.test_TorchHardSigmoid,    Y, N, Y),
+            "TorchGelu":            (self.test_TorchGelu,           Y, N, Y),
+            "TorchGroupNorm":       (self.test_TorchGroupNorm,      Y, N, N),
+            "TorchGroupNorm2":      (self.test_TorchGroupNorm2,     Y, N, N),
+            "TorchGRU":             (self.test_TorchGRU,            Y, N, Y),
+            "TorchIdentity":        (self.test_TorchIdentity,       Y, N, Y),
+            "TorchIndexCopy":       (self.test_TorchIndexCopy,      N, N, N),
+            "TorchInstanceNorm":    (self.test_TorchInstanceNorm,   Y, N, N),
+            "TorchInstanceNorm2":   (self.test_TorchInstanceNorm2,  Y, N, N),
+            "TorchLayerGroup":      (self.test_TorchLayerGroup,     Y, N, Y),
+            "TorchLayerNorm":       (self.test_TorchLayerNorm,      Y, N, Y),
+            "TorchLayerNorm2":      (self.test_TorchLayerNorm2,     Y, N, Y),
+            "TorchLogSoftmax":      (self.test_TorchLogSoftmax,     Y, N, Y),
+            "TorchLSTM":            (self.test_TorchLSTM,           Y, N, Y),
+            "TorchMaskedFill":      (self.test_TorchMaskedFill,     Y, N, N),
+            "TorchNonZero":         (self.test_TorchNonZero,        N, N, N),
+            "TorchReflectionPad":   (self.test_TorchReflectionPad,  Y, N, Y),
+            "TorchRoiAlign":        (self.test_TorchRoiAlign,       Y, N, N),
+            "TorchSize":            (self.test_TorchSize,           Y, N, Y),
+            "TorchStd":             (self.test_TorchStd,            Y, N, Y),
+            "TorchWhere":           (self.test_TorchWhere,          Y, N, N),
+            "TorchZeroPad":         (self.test_TorchZeroPad,        Y, N, Y),
+            #########################################
             # Special Pass test case, Alphabetically
-            #############################
-            "ConcatFuse": self.test_ConcatFuse,
-            "ConcatToSpace": self.test_ConcatToSpace,
-            "Conv3dTo2d": self.test_Conv3dTo2d,
-            "Div2Mul": self.test_Div2Mul,
-            "PermuteFuse": self.test_PermuteFuse,
-            "PixelNorm": self.test_PixelNorm,
-            "PixelNorm2": self.test_PixelNorm2,
-            "GatherToSlice": self.test_GatherToSlice,
-            "Mul2Scale": self.test_Mul2Scale,
-            "MatMulTranspose": self.test_MatMulTranspose,
-            # "PadConv1d": self.test_PadConv1d,
-            "PadConv2d": self.test_PadConv2d,
-            # "PadConv3d": self.test_PadConv3d,
-            # "PadPool1d": self.test_PadPool1d,
-            # "PadPool2d": self.test_PadPool2d,
-            # "PadPool3d": self.test_PadPool3d,
-            "ReshapeFuse": self.test_ReshapeFuse,
-            "SwapDimInner": self.test_SwapDimInner,
-            "ReduceTranspose": self.test_ReduceTranspose,
-            "SliceToReverse": self.test_SliceToReverse,
-            "StaticDynMixed": self.test_StaticDynMixed,
-            "ReduceFusePattern": self.test_ReduceFusePattern,
-            "ArgReducefull": self.test_ArgReducefull,
-            "TransposeArg": self.test_TransposeArg,
+            #########################################
+            # case: (test, bm1684x_support, bm1686_support, cv183x_support)
+            "ArgReducefull":    (self.test_ArgReducefull,   Y, N, N),
+            "ConcatFuse":       (self.test_ConcatFuse,      Y, N, Y),
+            "ConcatToSpace":    (self.test_ConcatToSpace,   Y, N, N),
+            "Conv3dTo2d":       (self.test_Conv3dTo2d,      Y, N, Y),
+            "Div2Mul":          (self.test_Div2Mul,         Y, N, Y),
+            "GaToSlice":        (self.test_GaToSlice,       Y, N, Y),
+            "Mul2Scale":        (self.test_Mul2Scale,       Y, N, Y),
+            "MatMulTranspose":  (self.test_MatMulTranspose, Y, N, Y),
+            "MatMulTranspose2":  (self.test_MatMulTranspose2, N, N, Y),
+            "PadConv1d":        (self.test_PadConv1d,       N, N, Y),
+            "PadConv2d":        (self.test_PadConv2d,       Y, N, Y),
+            "PadConv3d":        (self.test_PadConv3d,       N, N, N),
+            "PadPool1d":        (self.test_PadPool1d,       N, N, Y),
+            "PadPool2d":        (self.test_PadPool2d,       N, N, Y),
+            "PadPool3d":        (self.test_PadPool3d,       N, N, Y),
+            "PixelNorm":        (self.test_PixelNorm,       Y, N, N),
+            "PixelNorm2":       (self.test_PixelNorm2,      Y, N, N),
+            "PermuteFuse":      (self.test_PermuteFuse,     Y, N, Y),
+            "PermuteToReorg":   (self.test_PermuteToReorg,  Y, N, Y),
+            "PermuteToReorg2":  (self.test_PermuteToReorg2, Y, N, Y),
+            "PermuteToReshape": (self.test_PermuteToReshape,Y, N, N),
+            "Permute5dSplit":   (self.test_Permute5dSplit,  Y, N, Y),
+            "PoolAfterRelu":    (self.test_PoolAfterRelu,   Y, N, Y),
+            "PoolSignError":    (self.test_PoolSignError,   Y, N, Y),
+            "ReshapeFuse":      (self.test_ReshapeFuse,     Y, N, Y),
+            "ReduceTranspose":  (self.test_ReduceTranspose, Y, N, N),
+            "ReduceFuse":       (self.test_ReduceFuse,      Y, N, Y),
+            "SwapDimInner":     (self.test_SwapDimInner,    Y, N, N),
+            "SliceToReverse":   (self.test_SliceToReverse,  Y, N, N),
+            "StaticDynMixed":   (self.test_StaticDynMixed,  Y, N, N),
+            "TransposeArg":     (self.test_TransposeArg,    Y, N, N),
         }
+        # yapf: enable
 
         # no quantization when quant_mode == "f32"
         self.support_quant_modes = ["f32", "f16", "bf16", "int8"]
@@ -203,6 +229,10 @@ class ONNX_IR_TESTER(object):
         self.is_cv18xx = False
         self.chip = chip.lower()
         self.dynamic = dynamic
+        self.simple = simple
+        if self.simple:
+            self.support_quant_modes = ["f16", "int8"]
+            self.support_asym = [False]
         if self.chip.startswith("cv18"):
             self.support_quant_modes = ["bf16", "int8"]
             self.support_asym = [False]
@@ -221,20 +251,22 @@ class ONNX_IR_TESTER(object):
 
     def test_single(self, case: str):
         print("Test: {}".format(case))
-        if case in self.test_function:
-            self.test_function[case](case)
+        if case in self.test_cases:
+            func, _, _, _ = self.test_cases[case]
+            func(case)
             print("====== TEST {} Success ======".format(case))
         else:
             raise RuntimeError("case [{}] is not exist".format(case))
 
     def check_support(self, case):
-        if self.is_cv18xx:
-            if case in CV18XX_Failed_Cases:
-                return False
-        elif self.chip == "bm1684x":
-            if case in BM1684X_Failed_Cases:
-                return False
-        return True
+        _, bm1684x_support, bm1686_support, cv183x_support = self.test_cases[case]
+        if self.is_cv18xx and cv183x_support:
+            return True
+        if self.chip == "bm1684x" and bm1684x_support:
+            return True
+        if self.chip == "bm1686" and bm1686_support:
+            return True
+        return False
 
     def create_random_input(self, graph_def: onnx.GraphProto):
         inputs = {}
@@ -258,6 +290,7 @@ class ONNX_IR_TESTER(object):
 
         onnx_model = "{}_opt.onnx".format(model_name)
         input_npz = "{}_in_fp32.npz".format(model_name)
+        file_mark(input_npz)
         for name in input_data:
             if input_data[name].dtype in [np.int64, np.int32]:
                 input_data[name] = input_data[name].astype(np.int32)
@@ -320,6 +353,7 @@ class ONNX_IR_TESTER(object):
         input_data = np.load(input_npz)
         # save ref
         ref_npz = "{}_top_out.npz".format(model_name)
+        file_mark(ref_npz)
         # tpu mlir inference and compare
         if quant_mode == "int8" or quant_mode == "qdq":
             ref_tpu_tolerance = "0.95,0.70" if not isAsym else "0.90,0.54"
@@ -328,6 +362,7 @@ class ONNX_IR_TESTER(object):
         elif quant_mode == "bf16":
             ref_tpu_tolerance = "0.95,0.85"
         tpu_npz = tpu_mlir.replace(".mlir", "_tpu_out.npz")
+        file_mark(tpu_npz)
         show_fake_cmd(input_npz, tpu_mlir, tpu_npz)
         tpu_mlir_outs = mlir_inference(input_data, tpu_mlir, dump_all=True)
         if quant_mode == "qdq":
@@ -341,6 +376,7 @@ class ONNX_IR_TESTER(object):
             np.savez(tpu_npz, **tpu_mlir_outs)
         # bmodel / cvimodel inference and compare
         model_npz = bmodel.replace("." + bmodel.split(".")[-1], "_model_out.npz")
+        file_mark(model_npz)
         show_fake_cmd(input_npz, bmodel, model_npz)
         model_outs = model_inference(input_data, bmodel)
         np.savez(model_npz, **model_outs)
@@ -812,6 +848,12 @@ class ONNX_IR_TESTER(object):
         graph_def = helper.make_graph([gru_def],
                                       case_name, [input], [Y, Y_h],
                                       initializer=[w_value, r_value, b_value, h_value])
+        if self.is_cv18xx:
+            input_data = {}
+            input_data["input"] = np.random.rand(seq_length, batch_size,
+                                                 input_size).astype(np.float32)
+            self.onnx_and_test(graph_def, input_data=input_data)
+            return
         self.onnx_and_test(graph_def)
 
     def test_MaxPool1d(self, case_name):
@@ -1109,7 +1151,7 @@ class ONNX_IR_TESTER(object):
         output_shape = [1, oc, 100, 100]
         weight_data = np.random.randn(*filter_shape).astype(np.float32)
         bias_data = np.random.randn(oc).astype(np.float32)
-        alpha_cases = [0.67, -0.2]
+        alpha_cases = [0.67, 0.2]
         for i, a in enumerate(alpha_cases):
             input = helper.make_tensor_value_info('input', TensorProto.FLOAT, input_shape)
             output = helper.make_tensor_value_info('output', TensorProto.FLOAT, output_shape)
@@ -1149,6 +1191,43 @@ class ONNX_IR_TESTER(object):
 
         graph_def = helper.make_graph([mul_def], case_name, inputs, [output])
         self.onnx_and_test(graph_def)
+
+    def test_MulBcast(self, case_name):
+        shapes = ([7, 9, 44, 38], )
+        bcast_dims = ([[0], [2], [0, 2]], )
+        for i, s in enumerate(shapes):
+            for dims in bcast_dims[i]:
+                bcast_s = s[::]
+                for dim in dims:
+                    bcast_s[dim] = 1
+                a = helper.make_tensor_value_info("a", TensorProto.FLOAT, bcast_s)
+                b = helper.make_tensor_value_info("b", TensorProto.FLOAT, s)
+                c = helper.make_tensor_value_info("c", TensorProto.FLOAT, bcast_s)
+                output = helper.make_tensor_value_info("output", TensorProto.FLOAT, s)
+                Mul_def = helper.make_node("Mul", inputs=["a", "b"], outputs=["x"])
+                Mul_def_2 = helper.make_node("Mul", inputs=["x", "c"], outputs=["output"])
+                graph_def = helper.make_graph([Mul_def, Mul_def_2],
+                                              "{}_{}_{}".format(case_name, i,
+                                                                "".join(map(str, dims))), [a, b, c],
+                                              [output])
+                self.onnx_and_test(graph_def)
+
+    def test_MulBcast2(self, case_name):
+        shapes = ([4, 7, 1, 15], )
+        bcast_shapes = ([1, 7, 13, 15], )
+        out_shapes = ([4, 7, 13, 15], )
+        for i, s in enumerate(shapes):
+            a = helper.make_tensor_value_info("a", TensorProto.FLOAT, bcast_shapes[i])
+            b = helper.make_tensor_value_info("b", TensorProto.FLOAT, s)
+            c = helper.make_tensor_value_info("c", TensorProto.FLOAT, bcast_shapes[i])
+            output = helper.make_tensor_value_info("output", TensorProto.FLOAT, out_shapes[i])
+            Mul_def = helper.make_node("Mul", inputs=["a", "b"], outputs=["x"])
+            Mul_def_2 = helper.make_node("Mul", inputs=["x", "c"], outputs=["output"])
+            graph_def = helper.make_graph([Mul_def, Mul_def_2], "{}_{}".format(
+                case_name,
+                i,
+            ), [a, b, c], [output])
+            self.onnx_and_test(graph_def)
 
     def test_MulConst(self, case_name):
         input_shape = [1, 3, 27, 27]
@@ -1619,7 +1698,50 @@ class ONNX_IR_TESTER(object):
         graph_def = helper.make_graph([div_def], case_name, inputs, [output])
         self.onnx_and_test(graph_def, input_data=input_data)
 
-    def test_ConvTranspose(self, case_name):
+    def test_DivBcast(self, case_name):
+        shapes = ([6, 11, 39, 29], )
+        bcast_dims = ([[0], [2], [0, 2]], )
+        for i, s in enumerate(shapes):
+            for dims in bcast_dims[i]:
+                bcast_s = s[::]
+                for dim in dims:
+                    bcast_s[dim] = 1
+                a_data = np.random.randn(*bcast_s).astype(np.float32)
+                b_data = np.clip(np.random.randn(*s).astype(np.float32), 0.01, 10)
+                c_data = np.clip(np.random.randn(*bcast_s).astype(np.float32), 0.01, 10)
+                a = helper.make_tensor_value_info("a", TensorProto.FLOAT, bcast_s)
+                b = helper.make_tensor_value_info("b", TensorProto.FLOAT, s)
+                c = helper.make_tensor_value_info("c", TensorProto.FLOAT, bcast_s)
+                output = helper.make_tensor_value_info("output", TensorProto.FLOAT, s)
+                Div_def = helper.make_node("Div", inputs=["a", "b"], outputs=["x"])
+                Div_def_2 = helper.make_node("Div", inputs=["x", "c"], outputs=["output"])
+                graph_def = helper.make_graph([Div_def, Div_def_2],
+                                              "{}_{}_{}".format(case_name, i,
+                                                                "".join(map(str, dims))), [a, b, c],
+                                              [output])
+                self.onnx_and_test(graph_def, input_data={"a": a_data, "b": b_data, "c": c_data})
+
+    def test_DivBcast2(self, case_name):
+        shapes = ([5, 12, 1, 21], )
+        bcast_shapes = ([1, 12, 9, 21], )
+        out_shapes = ([5, 12, 9, 21], )
+        for i, s in enumerate(shapes):
+            a_data = np.random.randn(*bcast_shapes[i]).astype(np.float32)
+            b_data = np.clip(np.random.randn(*s).astype(np.float32), 0.01, 10)
+            c_data = np.clip(np.random.randn(*bcast_shapes[i]).astype(np.float32), 0.01, 10)
+            a = helper.make_tensor_value_info("a", TensorProto.FLOAT, bcast_shapes[i])
+            b = helper.make_tensor_value_info("b", TensorProto.FLOAT, s)
+            c = helper.make_tensor_value_info("c", TensorProto.FLOAT, bcast_shapes[i])
+            output = helper.make_tensor_value_info("output", TensorProto.FLOAT, out_shapes[i])
+            Div_def = helper.make_node("Div", inputs=["a", "b"], outputs=["x"])
+            Div_def_2 = helper.make_node("Div", inputs=["x", "c"], outputs=["output"])
+            graph_def = helper.make_graph([Div_def, Div_def_2], "{}_{}".format(
+                case_name,
+                i,
+            ), [a, b, c], [output])
+            self.onnx_and_test(graph_def, input_data={"a": a_data, "b": b_data, "c": c_data})
+
+    def test_ConvTrans(self, case_name):
         oc, ic = 16, 8
         ih, iw = 16, 16
         kernel_shape = [3, 3]
@@ -1639,20 +1761,20 @@ class ONNX_IR_TESTER(object):
         output = helper.make_tensor_value_info('output', TensorProto.FLOAT, output_shape)
         weight = helper.make_tensor('weight', TensorProto.FLOAT, filter_shape, weight_data)
         bias = helper.make_tensor('bias', TensorProto.FLOAT, list(bias_data.shape), bias_data)
-        convtranspose_def = helper.make_node("ConvTranspose",
-                                             inputs=['input', 'weight', 'bias'],
-                                             outputs=['output'],
-                                             kernel_shape=kernel_shape,
-                                             pads=pads,
-                                             strides=strides,
-                                             dilations=dilations,
-                                             group=1)
-        graph_def = helper.make_graph([convtranspose_def],
+        ConvTrans_def = helper.make_node("ConvTranspose",
+                                         inputs=['input', 'weight', 'bias'],
+                                         outputs=['output'],
+                                         kernel_shape=kernel_shape,
+                                         pads=pads,
+                                         strides=strides,
+                                         dilations=dilations,
+                                         group=1)
+        graph_def = helper.make_graph([ConvTrans_def],
                                       case_name, [input], [output],
                                       initializer=[weight, bias])
         self.onnx_and_test(graph_def)
 
-    def test_ConvTranspose2(self, case_name):
+    def test_ConvTrans2(self, case_name):
         input_shape = [1, 64, 35, 35]
         filter_shape = [64, 32, 2, 2]
         bias_shape = [32]
@@ -1664,15 +1786,15 @@ class ONNX_IR_TESTER(object):
         output = helper.make_tensor_value_info('output', TensorProto.FLOAT, output_shape)
         weight = helper.make_tensor('weight', TensorProto.FLOAT, filter_shape, weight_data)
         bias = helper.make_tensor('bias', TensorProto.FLOAT, bias_shape, bias_data)
-        convtranspose_def = helper.make_node("ConvTranspose",
-                                             inputs=['input', 'weight', 'bias'],
-                                             outputs=['output'],
-                                             kernel_shape=[2, 2],
-                                             pads=[0, 0, 0, 0],
-                                             strides=[2, 2],
-                                             dilations=[1, 1],
-                                             group=1)
-        graph_def = helper.make_graph([convtranspose_def],
+        ConvTrans_def = helper.make_node("ConvTranspose",
+                                         inputs=['input', 'weight', 'bias'],
+                                         outputs=['output'],
+                                         kernel_shape=[2, 2],
+                                         pads=[0, 0, 0, 0],
+                                         strides=[2, 2],
+                                         dilations=[1, 1],
+                                         group=1)
+        graph_def = helper.make_graph([ConvTrans_def],
                                       case_name, [input], [output],
                                       initializer=[weight, bias])
         self.onnx_and_test(graph_def)
@@ -1762,6 +1884,12 @@ class ONNX_IR_TESTER(object):
             outputs=['output'],
         )
         graph_def = helper.make_graph([sigmoid_def], case_name, [input], [output])
+        if 0:  # this code to test local layer, but when model use local layer, compare will not pass.
+            a = helper.make_tensor_value_info("a", TensorProto.FLOAT, input_shape)
+            add_out = helper.make_tensor_value_info("add_out", TensorProto.FLOAT, input_shape)
+            add_def = helper.make_node("Add", inputs=["a", "output"], outputs=["add_out"])
+            graph_def = helper.make_graph([sigmoid_def, add_def], case_name, [input, a], [add_out])
+
         self.onnx_and_test(graph_def)
 
     def test_Slice(self, case_name):
@@ -1779,7 +1907,7 @@ class ONNX_IR_TESTER(object):
         axes = helper.make_tensor('axes', TensorProto.INT64, [4], axes_data)
         steps = helper.make_tensor('steps', TensorProto.INT64, [4], steps_data)
         slice_def = helper.make_node(
-            case_name,
+            "Slice",
             inputs=['input', 'starts', 'ends', 'axes', 'steps'],
             outputs=['output'],
         )
@@ -1788,6 +1916,37 @@ class ONNX_IR_TESTER(object):
                                       case_name, [input], [output],
                                       initializer=[starts, ends, axes, steps])
         self.onnx_and_test(graph_def)
+
+    def test_Slice2(self, case_name):
+
+        class Model(nn.Module):
+
+            def __init__(self):
+                super(Model, self).__init__()
+
+            def forward(self, x):
+                y = x[:, :, 30::2, :42:2]
+                y = y + 1
+                return y
+
+        x = torch.randn(4, 8, 60, 80).float()
+        self.torch_and_test(x, Model(), case_name)
+
+    def test_Slice3(self, case_name):
+
+        class Model(nn.Module):
+
+            def __init__(self):
+                super(Model, self).__init__()
+
+            def forward(self, x):
+                y1 = x[:, :16, :, :]
+                y2 = x[:, 16:, :, :]
+                y = y1 * y2
+                return y
+
+        x = torch.randn(1, 32, 64, 88).float()
+        self.torch_and_test(x, Model(), case_name)
 
     def test_Split(self, case_name):
         input_shape = [6, 116, 64, 64]
@@ -1948,12 +2107,28 @@ class ONNX_IR_TESTER(object):
         x = torch.randn(10, 2).float()
         self.torch_and_test(x, Model(), case_name)
 
-    def test_TorchIdentity(self, case_name):
+    def test_TorchIndexCopy(self, case_name):
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
+                self.index = torch.tensor([0, 4, 2])
+                self.t = torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]], dtype=torch.float)
+
+            def forward(self, x):
+                y = torch.index_copy(x, 0, self.index, self.t)
+                return y
+
+        x = torch.randn(5, 3).float()
+        self.torch_and_test(x, Model(), case_name)
+
+    def test_TorchIdentity(self, case_name):
+
+        class Model(torch.nn.Module):
+
+            def __init__(self):
+                super(Model, self).__init__()
                 self.Identity = nn.Identity(54, unused_argument1=0.1, unused_argument2=False)
 
             def forward(self, x):
@@ -1962,14 +2137,14 @@ class ONNX_IR_TESTER(object):
                 return y
 
         x = torch.randn(1, 3, 100, 100).float()
-        self.torch_and_test(x, Net(), case_name)
+        self.torch_and_test(x, Model(), case_name)
 
     def test_TorchChannelShuffle(self, case_name):
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
                 self.channel_shuffle = nn.ChannelShuffle(2)
 
             def forward(self, x):
@@ -1977,14 +2152,14 @@ class ONNX_IR_TESTER(object):
                 return x
 
         x = torch.randn(1, 4, 100, 100).float()
-        self.torch_and_test(x, Net(), case_name)
+        self.torch_and_test(x, Model(), case_name)
 
     def test_TorchReflectionPad(self, case_name):
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
                 self.ReflectionPad1d = nn.ReflectionPad1d(2)
 
             def forward(self, x):
@@ -1992,7 +2167,7 @@ class ONNX_IR_TESTER(object):
                 return x
 
         x = torch.randn(3, 100, 100).float()
-        self.torch_and_test(x, Net(), case_name)
+        self.torch_and_test(x, Model(), case_name)
 
     def test_TorchRoiAlign(self, case_name):
         roi_num = 5
@@ -2007,9 +2182,8 @@ class ONNX_IR_TESTER(object):
                 y = torchvision.ops.roi_align(x, boxes, [8, 8])
                 return y
 
-        def gen_rand_rois(N, H, W, roi_num) -> torch.Tensor :
-            batch_indice = torch.randint(0, N, (roi_num,),
-                                         dtype=torch.int32).float()
+        def gen_rand_rois(N, H, W, roi_num) -> torch.Tensor:
+            batch_indice = torch.randint(0, N, (roi_num, ), dtype=torch.int32).float()
             roi_xl = torch.rand(roi_num, dtype=torch.float32) * (W - 1)
             roi_xh = torch.rand(roi_num, dtype=torch.float32) * (W - 1)
             roi_yl = torch.rand(roi_num, dtype=torch.float32) * (H - 1)
@@ -2055,10 +2229,10 @@ class ONNX_IR_TESTER(object):
 
     def test_TorchLogSoftmax(self, case_name):
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
                 self.linear = nn.Linear(32, 72, bias=False)
                 self.act = nn.LogSoftmax(dim=2)
 
@@ -2069,14 +2243,14 @@ class ONNX_IR_TESTER(object):
 
         input_shape = [3, 100, 32]
         input_data = torch.randn(input_shape)
-        self.torch_and_test(input_data, Net(), case_name)
+        self.torch_and_test(input_data, Model(), case_name)
 
     def test_TorchLSTM(self, case_name):
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
                 self.rnn = nn.LSTM(input_size=100, hidden_size=128, bidirectional=True)
 
             def forward(self, x, h_0, c_0):
@@ -2088,28 +2262,84 @@ class ONNX_IR_TESTER(object):
         c_0 = torch.randn(2, 1, 128)
 
         inputs = (input, h_0, c_0)
-        self.torch_and_test(inputs, Net(), case_name)
+        self.torch_and_test(inputs, Model(), case_name)
+
+    def test_TorchInstanceNorm(self, case_name):
+
+        class Model(torch.nn.Module):
+
+            def __init__(self):
+                super(Model, self).__init__()
+                self.instance_norm = nn.InstanceNorm2d(100, affine=True)
+
+            def forward(self, x):
+                return self.instance_norm(x)
+
+        x = torch.randn(20, 100, 35, 45).float()
+        self.torch_and_test(x, Model(), case_name)
+
+    def test_TorchInstanceNorm2(self, case_name):
+
+        class Model(torch.nn.Module):
+
+            def __init__(self):
+                super(Model, self).__init__()
+                self.instance_norm = nn.InstanceNorm2d(100, affine=True)
+
+            def forward(self, x):
+                return self.instance_norm(x + 1)
+
+        x = torch.randn(20, 100, 35, 45).float()
+        self.torch_and_test(x, Model(), case_name)
+
+    def test_TorchGroupNorm(self, case_name):
+
+        class Model(torch.nn.Module):
+
+            def __init__(self):
+                super(Model, self).__init__()
+                self.group_norm = nn.GroupNorm(3, 6)
+
+            def forward(self, x):
+                return self.group_norm(x)
+
+        x = torch.randn(20, 6, 10, 10).float()
+        self.torch_and_test(x, Model(), case_name)
+
+    def test_TorchGroupNorm2(self, case_name):
+
+        class Model(torch.nn.Module):
+
+            def __init__(self):
+                super(Model, self).__init__()
+                self.group_norm = nn.GroupNorm(3, 6)
+
+            def forward(self, x):
+                return self.group_norm(x + 1)
+
+        x = torch.randn(20, 6, 10, 10).float()
+        self.torch_and_test(x, Model(), case_name)
 
     def test_TorchGelu(self, case_name):
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
                 self.gelu = nn.GELU()
 
             def forward(self, x):
                 return self.gelu(x)
 
         x = torch.randn(1, 3, 100, 100).float()
-        self.torch_and_test(x, Net(), case_name)
+        self.torch_and_test(x, Model(), case_name)
 
     def test_TorchGRU(self, case_name):
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
                 self.gru = nn.GRU(input_size=100, hidden_size=50, bidirectional=True)
 
             def forward(self, x, h_0):
@@ -2119,15 +2349,15 @@ class ONNX_IR_TESTER(object):
         input = torch.randn(8, 16, 100)
         h_0 = torch.randn(2, 16, 50)
         inputs = (input, h_0)
-        self.torch_and_test(inputs, Net(), case_name)
+        self.torch_and_test(inputs, Model(), case_name)
 
     def test_TorchLayerNorm(self, case_name):
         normalize_shape = [13, 22]
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
                 self.layer_norm = nn.LayerNorm(normalize_shape, elementwise_affine=True)
 
             def forward(self, x):
@@ -2136,14 +2366,14 @@ class ONNX_IR_TESTER(object):
 
         input_shape = [14, 25] + normalize_shape
         input_data = torch.randn(input_shape)
-        self.torch_and_test(input_data, Net(), case_name)
+        self.torch_and_test(input_data, Model(), case_name)
 
     def test_TorchLayerNorm2(self, case_name):
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
                 self.layer_norm = nn.LayerNorm([25, 25])
                 nn.init.normal_(self.layer_norm.bias, std=0.01)
                 self.conv = nn.Conv2d(32, 32, 3, 1, 1)
@@ -2155,14 +2385,14 @@ class ONNX_IR_TESTER(object):
 
         input_shape = [4, 32, 25, 25]
         input_data = torch.randn(input_shape)
-        self.torch_and_test(input_data, Net(), case_name)
+        self.torch_and_test(input_data, Model(), case_name)
 
     def test_TorchMaskedFill(self, case_name):
 
-        class Net(nn.Module):
+        class Model(nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
 
             def forward(self, x):
                 y = x.masked_fill(x < 0.2, value=2)
@@ -2170,28 +2400,43 @@ class ONNX_IR_TESTER(object):
 
         input_shape = [2, 3, 100]
         input_data = torch.rand(input_shape)
-        self.torch_and_test(input_data, Net(), case_name)
+        self.torch_and_test(input_data, Model(), case_name)
+
+    def test_TorchNonZero(self, case_name):
+
+        class Model(nn.Module):
+
+            def __init__(self):
+                super(Model, self).__init__()
+
+            def forward(self, x):
+                y = x.nonzero()
+                return y
+
+        input_shape = [1, 4, 64, 32]
+        input_data = torch.rand(input_shape)
+        self.torch_and_test(input_data, Model(), case_name)
 
     def test_TorchStd(self, case_name):
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
 
             def forward(self, x):
                 return torch.std(x, -1)
 
         x = torch.randn(1, 3, 100, 100).float()
-        self.torch_and_test(x, Net(), case_name)
+        self.torch_and_test(x, Model(), case_name)
 
     def test_PixelNorm(self, case_name):
         N, C, H, W = 4, 8, 32, 32
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
                 self.scale = torch.randn(1, C, 1, 1).float()
                 self.bias = torch.randn(1, C, 1, 1).float()
 
@@ -2202,13 +2447,16 @@ class ONNX_IR_TESTER(object):
                 z = y * self.scale + self.bias
                 return z
 
+        x = torch.randn(N, C, H, W).float()
+        self.torch_and_test(x, Model(), case_name)
+
     def test_PixelNorm2(self, case_name):
         N, C, H, W = 4, 8, 32, 32
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
                 self.scale = torch.randn(1, C, 1, 1).float()
                 self.bias = torch.randn(1, C, 1, 1).float()
 
@@ -2221,14 +2469,14 @@ class ONNX_IR_TESTER(object):
                 return z
 
         x = torch.randn(N, C, H, W).float()
-        self.torch_and_test(x, Net(), case_name)
+        self.torch_and_test(x, Model(), case_name)
 
     def test_ConcatToSpace(self, case_name):
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self, no=0):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
                 self.conv = nn.Conv2d(160, 8, 3, 1, 1)
                 self.no = no
 
@@ -2277,23 +2525,23 @@ class ONNX_IR_TESTER(object):
 
         # case 0
         x = torch.randn(1, 40, 40, 384).float()
-        self.torch_and_test(x, Net(0), case_name + "_0")
+        self.torch_and_test(x, Model(0), case_name + "_0")
         # case 1
         x = torch.randn(1, 40, 40, 384).float()
-        self.torch_and_test(x, Net(1), case_name + "_1")
+        self.torch_and_test(x, Model(1), case_name + "_1")
         # case 2
         x = torch.randn(4, 2, 40, 40, 80).float()
-        self.torch_and_test(x, Net(2), case_name + "_2")
+        self.torch_and_test(x, Model(2), case_name + "_2")
         # case 3
         x = torch.randn(40, 40, 384).float()
-        self.torch_and_test(x, Net(3), case_name + "_3")
+        self.torch_and_test(x, Model(3), case_name + "_3")
 
     def test_ConcatFuse(self, case_name):
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
                 self.conv1 = nn.Conv2d(4, 4, 3, 1, 1)
                 self.conv2 = nn.Conv2d(4, 4, 3, 1, 1)
                 self.conv3 = nn.Conv2d(4, 16, 3, 2, 1)
@@ -2309,29 +2557,29 @@ class ONNX_IR_TESTER(object):
                 return e
 
         x = torch.randn(1, 4, 32, 32).float()
-        self.torch_and_test(x, Net(), case_name)
+        self.torch_and_test(x, Model(), case_name)
 
     def test_Conv3dTo2d(self, case_name):
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
                 self.conv3d = nn.Conv3d(3, 96, [10, 4, 4], [10, 4, 4], [0, 0, 0])
 
             def forward(self, x):
                 y = self.conv3d(x)
                 return y
 
-        x = torch.randn(1, 3, 10, 640, 640).float()
-        self.torch_and_test(x, Net(), case_name)
+        x = torch.randn(1, 3, 10, 320, 320).float()
+        self.torch_and_test(x, Model(), case_name)
 
-    def test_GatherToSlice(self, case_name):
+    def test_GaToSlice(self, case_name):
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
 
             def forward(self, x):
                 a = x[0]
@@ -2342,14 +2590,14 @@ class ONNX_IR_TESTER(object):
                 return e
 
         x = torch.randn(3, 36, 12, 49, 32).float()
-        self.torch_and_test(x, Net(), case_name)
+        self.torch_and_test(x, Model(), case_name)
 
     def test_PermuteFuse(self, case_name):
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
                 self.bias = torch.randn(96).float()
 
             def forward(self, x):
@@ -2360,15 +2608,14 @@ class ONNX_IR_TESTER(object):
                 return d
 
         x = torch.randn(1, 25600, 96).float()
-        self.torch_and_test(x, Net(), case_name)
+        self.torch_and_test(x, Model(), case_name)
 
     def test_MatMulTranspose(self, case_name):
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
-                self.bias = torch.randn(96).float()
+                super(Model, self).__init__()
 
             def forward(self, x, y):
                 a = torch.transpose(y, 2, 3)
@@ -2377,14 +2624,30 @@ class ONNX_IR_TESTER(object):
 
         x = torch.randn(10, 10, 49, 32).float()
         y = torch.randn(10, 10, 49, 32).float()
-        self.torch_and_test((x, y), Net(), case_name)
+        self.torch_and_test((x, y), Model(), case_name)
+
+    def test_MatMulTranspose2(self, case_name):
+
+        class Model(torch.nn.Module):
+
+            def __init__(self):
+                super(Model, self).__init__()
+
+            def forward(self, x, y):
+                a = torch.transpose(y, 2, 1)
+                b = torch.matmul(x, a)
+                return b
+
+        x = torch.randn(10, 10, 49, 32).float()
+        y = torch.randn(10, 32, 10, 49).float()
+        self.torch_and_test((x, y), Model(), case_name)
 
     def test_ReshapeFuse(self, case_name):
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
                 self.w0 = torch.randn(1, 3, 49, 49).float()
                 self.w1 = torch.randn(1, 529, 1, 49, 49).float()
                 self.w2 = torch.randn(1, 3, 49, 49).float()
@@ -2398,14 +2661,14 @@ class ONNX_IR_TESTER(object):
                 return e
 
         x = torch.randn(529, 3, 49, 49).float()
-        self.torch_and_test(x, Net(), case_name)
+        self.torch_and_test(x, Model(), case_name)
 
     def test_SwapDimInner(self, case_name):
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
 
             def forward(self, x):
                 y = torch.cat([x[:, 39:, :, :], x[:, :39, :, :]], 1)
@@ -2413,43 +2676,43 @@ class ONNX_IR_TESTER(object):
                 return z
 
         x = torch.randn(1, 42, 42, 384).float()
-        self.torch_and_test(x, Net(), case_name)
+        self.torch_and_test(x, Model(), case_name)
 
     def test_TorchWhere(self, case_name):
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
 
             def forward(self, a, b):
                 x = torch.where(a >= b, a, b)
                 return x
 
-        a = torch.randint(-128,127,(4, 3, 100, 100)).float()
-        b = torch.randint(-128,127,(4, 3, 100, 100)).float()
-        self.torch_and_test((a, b), Net(), case_name)
+        a = torch.randint(-128, 127, (4, 3, 100, 100)).float()
+        b = torch.randint(-128, 127, (4, 3, 100, 100)).float()
+        self.torch_and_test((a, b), Model(), case_name)
 
     def test_TorchSize(self, case_name):
 
-        class Net(nn.Module):
+        class Model(nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
 
             def forward(self, x):
                 y = torch.ones(x.size(1))
                 return torch.add(x, y)
 
         x = torch.randn(100, 256).float()
-        self.torch_and_test(x, Net(), case_name)
+        self.torch_and_test(x, Model(), case_name)
 
     def test_TorchChunk(self, case_name):
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
                 self.div_num = 2
 
             def forward(self, x):
@@ -2460,14 +2723,14 @@ class ONNX_IR_TESTER(object):
                 return x
 
         x = torch.randn(1, 3, 100, 100).float()
-        self.torch_and_test(x, Net(), case_name)
+        self.torch_and_test(x, Model(), case_name)
 
     def test_TorchActivation(self, case_name):
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
                 self.linear = nn.Linear(100, 200, bias=False)
                 self.softplus = nn.Softplus()
                 self.hardsigmoid = nn.Hardsigmoid()
@@ -2520,14 +2783,14 @@ class ONNX_IR_TESTER(object):
                 return y
 
         x = torch.randn(3, 100, 100).float()
-        self.torch_and_test(x, Net(), case_name)
+        self.torch_and_test(x, Model(), case_name)
 
     def test_TorchArgmax(self, case_name):
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
 
             def forward(self, x):
                 a = torch.argmax(x, -1)
@@ -2537,14 +2800,14 @@ class ONNX_IR_TESTER(object):
         x = np.arange(0, 128000, step=1, dtype=np.float32)
         np.random.shuffle(x)
         x = torch.from_numpy(x.reshape(40, 40, 80))
-        self.torch_and_test(x, Net(), case_name)
+        self.torch_and_test(x, Model(), case_name)
 
     def test_TorchZeroPad(self, case_name):
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
                 ## left:3 right:4 up:4 down:6 postion pad zero
                 self.ZeroPad2d = nn.ZeroPad2d(padding=(3, 4, 5, 6))
 
@@ -2554,14 +2817,33 @@ class ONNX_IR_TESTER(object):
                 return x
 
         x = torch.randn(4, 3, 100, 100).float()
-        self.torch_and_test(x, Net(), case_name)
+        self.torch_and_test(x, Model(), case_name)
 
-    def test_TorchConv3dTranspose(self, case_name):
+    def test_TorchConv2d(self, case_name):
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
+                self.conv2d = nn.Conv2d(in_channels=10,
+                                        out_channels=10,
+                                        kernel_size=3,
+                                        stride=1,
+                                        padding=16,
+                                        dilation=16)
+
+            def forward(self, x):
+                return self.conv2d(x)
+
+        x = torch.randn(1, 10, 64, 64).float()
+        self.torch_and_test(x, Model(), case_name)
+
+    def test_TorchConv3dTrans(self, case_name):
+
+        class Model(torch.nn.Module):
+
+            def __init__(self):
+                super(Model, self).__init__()
                 self.filter = torch.randn(96, 3, 6, 4, 4)
 
             def forward(self, x):
@@ -2570,14 +2852,14 @@ class ONNX_IR_TESTER(object):
                 return x
 
         x = torch.randn(1, 6, 3, 640, 640).float()
-        self.torch_and_test(x, Net(), case_name)
+        self.torch_and_test(x, Model(), case_name)
 
     def test_StaticDynMixed(self, case_name):
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
                 self.conv1 = nn.Conv2d(8, 8, 3, 1, 1)
                 self.conv2 = nn.Conv2d(8, 8, 3, 1, 1)
 
@@ -2588,7 +2870,7 @@ class ONNX_IR_TESTER(object):
                 return c, indices
 
         x = torch.randn(4, 8, 100, 20).float()
-        self.torch_and_test(x, Net(), case_name)
+        self.torch_and_test(x, Model(), case_name)
 
     def test_Add(self, case_name):
         shapes = ([1, 3, 27, 27], [2, 6, 56, 56], [4, 9, 56, 56])
@@ -2598,6 +2880,119 @@ class ONNX_IR_TESTER(object):
             output = helper.make_tensor_value_info("output", TensorProto.FLOAT, s)
             add_def = helper.make_node("Add", inputs=["a", "b"], outputs=["output"])
             graph_def = helper.make_graph([add_def], "{}_{}".format(case_name, i), [a, b], [output])
+            if 0:  # the follow code used to test local layer, but local layer compare faild. so I just closed it, and commit it.
+                c = helper.make_tensor_value_info("c", TensorProto.FLOAT, s)
+                add2_out = helper.make_tensor_value_info("add2_out", TensorProto.FLOAT, s)
+                add2_def = helper.make_node("Add", inputs=["c", "output"], outputs=["add2_out"])
+                graph_def = helper.make_graph([add_def, add2_def], "{}_{}".format(case_name, i),
+                                              [a, b, c], [add2_out])
+            self.onnx_and_test(graph_def)
+
+    def test_tmp(self, case_name):
+        shapes = ([16, 9, 67, 323], )
+        bcast_dims = ([[3]], )
+        for i, s in enumerate(shapes):
+            for dims in bcast_dims[i]:
+                bcast_s = s[::]
+                for dim in dims:
+                    bcast_s[dim] = 1
+                a = helper.make_tensor_value_info("a", TensorProto.FLOAT, bcast_s)
+                b = helper.make_tensor_value_info("b", TensorProto.FLOAT, s)
+                c = helper.make_tensor_value_info("c", TensorProto.FLOAT, bcast_s)
+                output = helper.make_tensor_value_info("output", TensorProto.FLOAT, s)
+                add_def = helper.make_node("Add", inputs=["a", "b"], outputs=["x"])
+                add_def_2 = helper.make_node("Add", inputs=["x", "c"], outputs=["output"])
+                graph_def = helper.make_graph([add_def, add_def_2],
+                                              "{}_{}_{}".format(case_name, i,
+                                                                "".join(map(str, dims))), [a, b, c],
+                                              [output])
+                self.onnx_and_test(graph_def)
+
+    def test_AddBcast(self, case_name):
+        shapes = (
+            [
+                10,
+            ],
+            [9, 12],
+            [7, 14, 15],
+            [16, 9, 323, 67],
+            #   [4, 7, 38, 6, 4],
+            #   [3, 3, 11, 3, 4, 5],
+        )
+        bcast_dims = (
+            [[0]],
+            [[0], [1]],
+            [[0], [2], [0, 2], [0, 1, 2]],
+            [[0], [2], [0, 2], [0, 3], [2, 3], [0, 2, 3], [0, 1, 2, 3]],
+            #   [[0], [2], [0, 2], [3, 4], [2, 3, 4]],
+            #   [[0], [2], [0, 2], [3, 4, 5], [2, 3, 4, 5]],
+        )
+        for i, s in enumerate(shapes):
+            for dims in bcast_dims[i]:
+                bcast_s = s[::]
+                for dim in dims:
+                    bcast_s[dim] = 1
+                a = helper.make_tensor_value_info("a", TensorProto.FLOAT, bcast_s)
+                b = helper.make_tensor_value_info("b", TensorProto.FLOAT, s)
+                c = helper.make_tensor_value_info("c", TensorProto.FLOAT, bcast_s)
+                output = helper.make_tensor_value_info("output", TensorProto.FLOAT, s)
+                add_def = helper.make_node("Add", inputs=["a", "b"], outputs=["x"])
+                add_def_2 = helper.make_node("Add", inputs=["x", "c"], outputs=["output"])
+                graph_def = helper.make_graph([add_def, add_def_2],
+                                              "{}_{}_{}".format(case_name, i,
+                                                                "".join(map(str, dims))), [a, b, c],
+                                              [output])
+                self.onnx_and_test(graph_def)
+
+    def test_AddBcast2(self, case_name):
+        shapes = (
+            [4, 16, 1, 11],
+            [3, 6, 1, 12],
+        )
+        bcast_shapes = (
+            [4, 16, 9, 1],
+            [1, 6, 21, 1],
+        )
+        out_shapes = (
+            [4, 16, 9, 11],
+            [3, 6, 21, 12],
+        )
+        for i, s in enumerate(shapes):
+            a = helper.make_tensor_value_info("a", TensorProto.FLOAT, bcast_shapes[i])
+            b = helper.make_tensor_value_info("b", TensorProto.FLOAT, s)
+            c = helper.make_tensor_value_info("c", TensorProto.FLOAT, bcast_shapes[i])
+            output = helper.make_tensor_value_info("output", TensorProto.FLOAT, out_shapes[i])
+            add_def = helper.make_node("Add", inputs=["a", "b"], outputs=["x"])
+            add_def_2 = helper.make_node("Add", inputs=["x", "c"], outputs=["output"])
+            graph_def = helper.make_graph([add_def, add_def_2], "{}_{}".format(
+                case_name,
+                i,
+            ), [a, b, c], [output])
+            self.onnx_and_test(graph_def)
+
+    # Known issue: failed cases.
+    # The first one has a too large w shape and needs broadcast so cannot reshape. W is too large for local mem.
+    # Stuck in finding layer groups: is_layer_group_valid->group_one_layer_proc->getGlobalLayerCycle->global codegen->tensor_split_nh->while, as TPU_KERNEL_ASSERT is not enabled.
+    # The second one has 6-dim broadcast data and goes global. Most dims cannot be merged so the shape_dim is 5 when merging ends.
+    # Forcibly assigning a 5-dim shape into a dim4 shape, it messes up the n-dim shape and raises assert for "n-dim cannot broadcast" in calling local function.
+    def test_AddBcast3(self, case_name):
+        shapes = ([4, 9, 56, 56 * 27 * 16], )
+        bcast_shapes = ([4, 1, 56, 56 * 27 * 16], )
+        out_shapes = ([4, 9, 56, 56 * 27 * 16], )
+        shapes = ([4, 9, 10, 11, 12, 7], )
+        bcast_shapes = ([4, 1, 10, 1, 12, 7], )
+        out_shapes = ([4, 9, 10, 11, 12, 7], )
+        for i, s in enumerate(shapes):
+            a = helper.make_tensor_value_info("a", TensorProto.FLOAT, bcast_shapes[i])
+            b = helper.make_tensor_value_info("b", TensorProto.FLOAT, s)
+            c = helper.make_tensor_value_info("c", TensorProto.FLOAT, bcast_shapes[i])
+            output = helper.make_tensor_value_info("output", TensorProto.FLOAT, out_shapes[i])
+            add_def = helper.make_node("Add", inputs=["a", "b"], outputs=["x"])
+            add_def_2 = helper.make_node("Add", inputs=["c", "x"], outputs=["output"])
+            graph_def = helper.make_graph([add_def, add_def_2], "{}_{}".format(
+                case_name,
+                i,
+            ), [a, b, c], [output])
             self.onnx_and_test(graph_def)
 
     def test_AddConst(self, case_name):
@@ -2624,7 +3019,7 @@ class ONNX_IR_TESTER(object):
                                       initializer=[w_value])
         self.onnx_and_test(graph_def)
 
-    def test_BroadcastAdd(self, case_name):
+    def test_BCastAdd(self, case_name):
         # 18xx: only broadcast right opd and broadcast continuous axis is supported
         if self.is_cv18xx:
             input_shape = {"input1": [2, 3, 27, 27], "input2": [2, 1, 1, 27]}
@@ -2801,7 +3196,7 @@ class ONNX_IR_TESTER(object):
                                       initializer=[w_value, r_value, b_value])
         self.onnx_and_test(graph_def)
 
-    def test_BroadcastMul(self, case_name):
+    def test_BCastMul(self, case_name):
         input_shape = {"input1": [1, 3, 1, 27], "input2": [2, 1, 27, 1]}
         output_shape = [2, 3, 27, 27]
         if self.is_cv18xx:
@@ -2816,7 +3211,7 @@ class ONNX_IR_TESTER(object):
         graph_def = helper.make_graph([mul_def], case_name, inputs, [output])
         self.onnx_and_test(graph_def)
 
-    def test_BroadcastMulConst(self, case_name):
+    def test_BCastMulCst(self, case_name):
         input_shape = [1, 127, 270, 28]
         constant_shape = [2, 1, 1, 28]
         output_shape = [2, 127, 270, 28]
@@ -2970,6 +3365,43 @@ class ONNX_IR_TESTER(object):
         )
         self.onnx_and_test(graph_def)
 
+    def test_SubBcast(self, case_name):
+        shapes = ([4, 9, 23, 39], )
+        bcast_dims = ([[0], [2], [0, 2]], )
+        for i, s in enumerate(shapes):
+            for dims in bcast_dims[i]:
+                bcast_s = s[::]
+                for dim in dims:
+                    bcast_s[dim] = 1
+                a = helper.make_tensor_value_info("a", TensorProto.FLOAT, bcast_s)
+                b = helper.make_tensor_value_info("b", TensorProto.FLOAT, s)
+                c = helper.make_tensor_value_info("c", TensorProto.FLOAT, bcast_s)
+                output = helper.make_tensor_value_info("output", TensorProto.FLOAT, s)
+                sub_def = helper.make_node("Sub", inputs=["a", "b"], outputs=["x"])
+                sub_def_2 = helper.make_node("Sub", inputs=["x", "c"], outputs=["output"])
+                graph_def = helper.make_graph([sub_def, sub_def_2],
+                                              "{}_{}_{}".format(case_name, i,
+                                                                "".join(map(str, dims))), [a, b, c],
+                                              [output])
+                self.onnx_and_test(graph_def)
+
+    def test_SubBcast2(self, case_name):
+        shapes = ([6, 7, 1, 11], )
+        bcast_shapes = ([1, 7, 13, 11], )
+        out_shapes = ([6, 7, 13, 11], )
+        for i, s in enumerate(shapes):
+            a = helper.make_tensor_value_info("a", TensorProto.FLOAT, bcast_shapes[i])
+            b = helper.make_tensor_value_info("b", TensorProto.FLOAT, s)
+            c = helper.make_tensor_value_info("c", TensorProto.FLOAT, bcast_shapes[i])
+            output = helper.make_tensor_value_info("output", TensorProto.FLOAT, out_shapes[i])
+            sub_def = helper.make_node("Sub", inputs=["a", "b"], outputs=["x"])
+            sub_def_2 = helper.make_node("Sub", inputs=["x", "c"], outputs=["output"])
+            graph_def = helper.make_graph([sub_def, sub_def_2], "{}_{}".format(
+                case_name,
+                i,
+            ), [a, b, c], [output])
+            self.onnx_and_test(graph_def)
+
     def test_SubConst(self, case_name):
         input_shape = [4, 3, 27, 27]
         output_shape = [4, 3, 27, 27]
@@ -3077,6 +3509,26 @@ class ONNX_IR_TESTER(object):
         graph_def = helper.make_graph([max_def], case_name, inputs, [output])
         self.onnx_and_test(graph_def)
 
+    def test_MaxBcast(self, case_name):
+        shapes = ([6, 8, 39, 41], )
+        bcast_dims = ([[0], [2], [0, 2]], )
+        for i, s in enumerate(shapes):
+            for dims in bcast_dims[i]:
+                bcast_s = s[::]
+                for dim in dims:
+                    bcast_s[dim] = 1
+                a = helper.make_tensor_value_info("a", TensorProto.FLOAT, bcast_s)
+                b = helper.make_tensor_value_info("b", TensorProto.FLOAT, s)
+                c = helper.make_tensor_value_info("c", TensorProto.FLOAT, bcast_s)
+                output = helper.make_tensor_value_info("output", TensorProto.FLOAT, s)
+                Max_def = helper.make_node("Max", inputs=["a", "b"], outputs=["x"])
+                Max_def_2 = helper.make_node("Max", inputs=["x", "c"], outputs=["output"])
+                graph_def = helper.make_graph([Max_def, Max_def_2],
+                                              "{}_{}_{}".format(case_name, i,
+                                                                "".join(map(str, dims))), [a, b, c],
+                                              [output])
+                self.onnx_and_test(graph_def)
+
     def test_Min(self, case_name):
         input_shape = {"input1": [1, 85, 32, 8], "input2": [1, 85, 32, 8]}
         output_shape = [1, 85, 32, 8]
@@ -3089,6 +3541,26 @@ class ONNX_IR_TESTER(object):
 
         graph_def = helper.make_graph([min_def], case_name, inputs, [output])
         self.onnx_and_test(graph_def)
+
+    def test_MinBcast(self, case_name):
+        shapes = ([5, 11, 23, 27], )
+        bcast_dims = ([[0], [2], [0, 2]], )
+        for i, s in enumerate(shapes):
+            for dims in bcast_dims[i]:
+                bcast_s = s[::]
+                for dim in dims:
+                    bcast_s[dim] = 1
+                a = helper.make_tensor_value_info("a", TensorProto.FLOAT, bcast_s)
+                b = helper.make_tensor_value_info("b", TensorProto.FLOAT, s)
+                c = helper.make_tensor_value_info("c", TensorProto.FLOAT, bcast_s)
+                output = helper.make_tensor_value_info("output", TensorProto.FLOAT, s)
+                Min_def = helper.make_node("Min", inputs=["a", "b"], outputs=["x"])
+                Min_def_2 = helper.make_node("Min", inputs=["x", "c"], outputs=["output"])
+                graph_def = helper.make_graph([Min_def, Min_def_2],
+                                              "{}_{}_{}".format(case_name, i,
+                                                                "".join(map(str, dims))), [a, b, c],
+                                              [output])
+                self.onnx_and_test(graph_def)
 
     def test_Abs(self, case_name):
         input_shape = [1, 16, 64, 64]
@@ -3184,7 +3656,7 @@ class ONNX_IR_TESTER(object):
                                       initializer=[constant])
         self.onnx_and_test(graph_def)
 
-    def test_CompareConst(self, case_name):
+    def test_CompareCst(self, case_name):
         shape = [1, 3, 27, 27]
         input = helper.make_tensor_value_info("input", TensorProto.FLOAT, shape)
         constant = helper.make_tensor("constant", TensorProto.FLOAT, [1],
@@ -3468,9 +3940,8 @@ class ONNX_IR_TESTER(object):
                                          perm=transpose_order)
         arg_keepdims = False
         arg_axis = 1
-        reduce_output_shape = [8,1,16,64]
-        arg_output = helper.make_tensor_value_info('output', TensorProto.INT64,
-                                                      reduce_output_shape)
+        reduce_output_shape = [8, 1, 16, 64]
+        arg_output = helper.make_tensor_value_info('output', TensorProto.INT64, reduce_output_shape)
         arg_max_def = helper.make_node(
             'ArgMax',
             ['transpose_output'],
@@ -3483,33 +3954,32 @@ class ONNX_IR_TESTER(object):
         self.onnx_and_test(graph_def)
 
     def test_ArgReducefull(self, case_name):
-        input_shape = [2,3,4]
+        input_shape = [2, 3, 4]
         arg_axis = 0
         reduce_axes = [0]
         reduce_axes_num = 1
         input = helper.make_tensor_value_info('input', TensorProto.FLOAT, input_shape)
-        output_shape = [1,3,4]
-        arg_output = helper.make_tensor_value_info('arg_output', TensorProto.INT64,
-                                                         output_shape)
+        output_shape = [1, 3, 4]
+        arg_output = helper.make_tensor_value_info('arg_output', TensorProto.INT64, output_shape)
         arg_def = helper.make_node("ArgMax",
-                                         inputs=['input'],
-                                         outputs=['arg_output'],
-                                         axis=arg_axis)
+                                   inputs=['input'],
+                                   outputs=['arg_output'],
+                                   axis=arg_axis)
         reduce_output_1 = helper.make_tensor_value_info('reduce_output_1', TensorProto.FLOAT,
-                                                         output_shape)
+                                                        output_shape)
         reduce_def_1 = helper.make_node("ReduceMax",
-                                         inputs=['input'],
-                                         outputs=['reduce_output_1'],
-                                         axes=reduce_axes)
+                                        inputs=['input'],
+                                        outputs=['reduce_output_1'],
+                                        axes=reduce_axes)
         reduce_output_2 = helper.make_tensor_value_info('reduce_output_2', TensorProto.FLOAT,
-                                                         output_shape)
+                                                        output_shape)
         reduce_def_2 = helper.make_node("ReduceMax",
-                                         inputs=['input'],
-                                         outputs=['reduce_output_2'],
-                                         axes=reduce_axes)
+                                        inputs=['input'],
+                                        outputs=['reduce_output_2'],
+                                        axes=reduce_axes)
 
         graph_def = helper.make_graph([arg_def, reduce_def_1, reduce_def_2], case_name, [input],
-                                      [arg_output,reduce_output_1,reduce_output_2])
+                                      [arg_output, reduce_output_1, reduce_output_2])
         self.onnx_and_test(graph_def)
 
     # def test_LayerNorm(self, case_name):
@@ -3718,20 +4188,154 @@ class ONNX_IR_TESTER(object):
                                       initializer=[starts, ends, axes, steps])
         self.onnx_and_test(graph_def)
 
-    def test_ReduceFusePattern(self, case_name):
+    def test_ReduceFuse(self, case_name):
 
-        class Net(torch.nn.Module):
+        class Model(torch.nn.Module):
 
             def __init__(self):
-                super(Net, self).__init__()
+                super(Model, self).__init__()
 
             def forward(self, x):
-                x = torch.sum(x,1)
-                x = torch.sum(x,1)
+                x = torch.sum(x, 1)
+                x = torch.sum(x, 1)
                 return x
 
         x = torch.randn(2, 2, 3, 4).float()
-        self.torch_and_test(x, Net(), case_name)
+        self.torch_and_test(x, Model(), case_name)
+
+    def test_PermuteToReshape(self, case_name):
+        input_shapes = [[4, 3, 28, 1], [4, 1, 3, 20]]
+        transpose_orders = [[0, 1, 3, 2], [0, 2, 1, 3]]
+        for i, input_shape in enumerate(input_shapes):
+            input = helper.make_tensor_value_info('input', TensorProto.FLOAT, input_shape)
+            order = transpose_orders[i]
+            output_shape = [input_shape[order[i]] for i in range(len(order))]
+            output = helper.make_tensor_value_info('output', TensorProto.FLOAT, output_shape)
+            transpose_def = helper.make_node("Transpose",
+                                             inputs=['input'],
+                                             outputs=['output'],
+                                             perm=order)
+            graph_def = helper.make_graph([transpose_def], "{}_{}".format(case_name, i), [input],
+                                          [output])
+            self.onnx_and_test(graph_def)
+
+    def test_PermuteToReorg(self, case_name):
+        input_shape = [1, 4, 6, 6]
+        output_shape = [1, 16, 3, 3]
+        input = helper.make_tensor_value_info('input', TensorProto.FLOAT, input_shape)
+        output = helper.make_tensor_value_info('output', TensorProto.FLOAT, output_shape)
+        rshape1 = [6]
+        rshape1_data = np.array([1, 4, 3, 2, 3, 2], dtype=np.int64)
+        r1 = helper.make_tensor('shape1', TensorProto.INT64, rshape1, rshape1_data)
+        reshape1_def = helper.make_node("Reshape", inputs=['input', 'shape1'], outputs=['out1'])
+        order = [0, 1, 3, 5, 2, 4]
+        permute_def = helper.make_node("Transpose", inputs=['out1'], outputs=['out2'], perm=order)
+        rshape2 = [4]
+        rshape2_data = np.array(output_shape, dtype=np.int64)
+        r2 = helper.make_tensor('shape2', TensorProto.INT64, rshape2, rshape2_data)
+        reshape2_def = helper.make_node("Reshape", inputs=['out2', 'shape2'], outputs=['output'])
+        graph_def = helper.make_graph([reshape1_def, permute_def, reshape2_def],
+                                      case_name, [input], [output],
+                                      initializer=[r1, r2])
+        self.onnx_and_test(graph_def)
+
+    def test_PermuteToReorg2(self, case_name):
+        input_shape = [1, 16, 200, 200]
+        output_shape = [1, 64, 100, 100]
+        input = helper.make_tensor_value_info('input', TensorProto.FLOAT, input_shape)
+        output = helper.make_tensor_value_info('output', TensorProto.FLOAT, output_shape)
+        rshape1 = [6]
+        rshape1_data = np.array([1, 16, 100, 2, 100, 2], dtype=np.int64)
+        r1 = helper.make_tensor('shape1', TensorProto.INT64, rshape1, rshape1_data)
+        reshape1_def = helper.make_node("Reshape", inputs=['input', 'shape1'], outputs=['out1'])
+        order = [0, 1, 3, 5, 2, 4]
+        permute_def = helper.make_node("Transpose", inputs=['out1'], outputs=['out2'], perm=order)
+        rshape2 = [4]
+        rshape2_data = np.array(output_shape, dtype=np.int64)
+        r2 = helper.make_tensor('shape2', TensorProto.INT64, rshape2, rshape2_data)
+        reshape2_def = helper.make_node("Reshape", inputs=['out2', 'shape2'], outputs=['out3'])
+        #add conv define
+        filter_shape = [64, 64, 3, 3]
+        kernel = [3, 3]
+        padding = [1, 1, 1, 1]
+        stride = [1, 1]
+        dilation = [1, 1]
+        weight_data = np.random.randn(*filter_shape).astype(np.float32)
+        bias_data = np.random.randn(output_shape[1]).astype(np.float32)
+        weight = helper.make_tensor("weight", TensorProto.FLOAT, filter_shape, weight_data)
+        bias = helper.make_tensor("bias", TensorProto.FLOAT, list(bias_data.shape), bias_data)
+        conv_def = helper.make_node("Conv",
+                                    inputs=['out3', 'weight', 'bias'],
+                                    outputs=['output'],
+                                    kernel_shape=kernel,
+                                    pads=padding,
+                                    strides=stride,
+                                    dilations=dilation,
+                                    group=1)
+        graph_def = helper.make_graph([reshape1_def, permute_def, reshape2_def, conv_def],
+                                      case_name, [input], [output],
+                                      initializer=[r1, r2, weight, bias])
+        self.onnx_and_test(graph_def)
+
+    def test_Permute5dSplit(self, case_name):
+        input_shape = [2, 4, 16, 20, 32]
+        orders = [[0, 4, 2, 1, 3], [3, 1, 0, 4, 2], [2, 1, 3, 4, 0], [1, 0, 2, 4, 3],
+                  [4, 0, 3, 2, 1], [4, 3, 2, 1, 0]]
+        for i in range(0, len(orders)):
+            order = orders[i]
+            if i >= 3 and self.chip.startswith("cv18"):
+                #because cv183x backend don't support all permute4d
+                continue
+            print("order:", order)
+            output_shape = [input_shape[order[i]] for i in range(0, len(order))]
+            input = helper.make_tensor_value_info('input', TensorProto.FLOAT, input_shape)
+            output = helper.make_tensor_value_info('output', TensorProto.FLOAT, output_shape)
+            permute_def = helper.make_node("Transpose",
+                                           inputs=['input'],
+                                           outputs=['output'],
+                                           perm=order)
+            graph_def = helper.make_graph([permute_def], "{}_{}".format(case_name, i), [input],
+                                          [output])
+            self.onnx_and_test(graph_def)
+
+    def test_PoolSignError(self, case_name):
+
+        class Model(torch.nn.Module):
+
+            def __init__(self):
+                super(Model, self).__init__()
+                self.relu = nn.ReLU()
+                self.conv = nn.Conv2d(8, 8, 3, 2, 1)
+                self.pool = nn.AvgPool2d(2, 2)
+
+            def forward(self, x):
+                a = self.relu(x)
+                b = self.pool(a)
+                c = self.conv(x)
+                d = b + c
+                return d
+
+        x = torch.randn(4, 8, 32, 32).float()
+        self.torch_and_test(x, Model(), case_name)
+
+    def test_PoolAfterRelu(self, case_name):
+
+        class Model(torch.nn.Module):
+
+            def __init__(self):
+                super(Model, self).__init__()
+                self.relu = nn.ReLU()
+                self.matmul = nn.Linear(32, 16)
+                self.pool = nn.AvgPool2d(2, 2)
+
+            def forward(self, x):
+                a = self.relu(x)
+                b = self.pool(a)
+                c = self.matmul(x)
+                return b, c
+
+        x = torch.randn(4, 8, 32, 32).float()
+        self.torch_and_test(x, Model(), case_name)
 
 
 def test_one_case_in_all(tester: ONNX_IR_TESTER, case, error_cases, success_cases):
@@ -3748,7 +4352,7 @@ def test_all(tester: ONNX_IR_TESTER):
     processes = []
     error_cases = multiprocessing.Manager().list()
     success_cases = multiprocessing.Manager().list()
-    for case in tester.test_function:
+    for case in tester.test_cases:
         if tester.check_support(case):
             p = multiprocessing.Process(target=test_one_case_in_all,
                                         args=(tester, case, error_cases, success_cases))
@@ -3783,13 +4387,15 @@ if __name__ == "__main__":
     parser.add_argument("--mode", default="all", type=str, choices=['all', 'f32', 'f16', 'bf16', 'int8', 'int4'],
                         help="chip platform name")
     parser.add_argument("--dynamic", action="store_true", help='do dynamic compile')
+    parser.add_argument("--debug", action="store_true", help='keep middle file if debug')
+    parser.add_argument("--simple", action="store_true", help='do simple test for commit test')
     parser.add_argument("--show_all", action="store_true", help='show all cases')
     # yapf: enable
     args = parser.parse_args()
-    tester = ONNX_IR_TESTER(args.chip, args.mode, args.dynamic)
+    tester = ONNX_IR_TESTER(args.chip, args.mode, args.dynamic, args.simple)
     if args.show_all:
         print("====== Show All Cases ============")
-        for case in tester.test_function:
+        for case in tester.test_cases:
             print(case)
         exit(0)
     dir = "onnx_test_{}".format(args.chip)
@@ -3799,3 +4405,5 @@ if __name__ == "__main__":
         test_all(tester)
     else:
         tester.test_single(args.case)
+    if args.debug == False:
+        file_clean()

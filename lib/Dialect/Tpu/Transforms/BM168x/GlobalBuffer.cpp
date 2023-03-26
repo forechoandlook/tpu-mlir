@@ -6,10 +6,12 @@
 // third-party components.
 //
 //===----------------------------------------------------------------------===//
+#include "tpu_mlir/Backend/BM168x/BM1684.h"
 #include "tpu_mlir/Backend/BM168x/BM168x.h"
 #include "tpu_mlir/Dialect/Tpu/IR/TpuOps.h"
-#include "tpu_mlir/Support/Module.h"
 #include "tpu_mlir/Dialect/Tpu/Transforms/BM168x/BMAddressAssign.h"
+#include "tpu_mlir/Support/MathUtils.h"
+#include "tpu_mlir/Support/Module.h"
 
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Pass/Pass.h"
@@ -109,6 +111,87 @@ public:
   }
 };
 
+class SliceGlobalBuffer : public OpRewritePattern<tpu::SliceOp> {
+public:
+  using OpRewritePattern<tpu::SliceOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(tpu::SliceOp sliceOp,
+                                PatternRewriter &rewriter) const override {
+    if (!module::isNone(sliceOp.getBuffer())) {
+      return failure();
+    }
+    if (!module::isBM1684Family()) {
+      return failure();
+    }
+    if (!module::isUniformQuantized(sliceOp.getInput())) {
+      return failure();
+    }
+    if (!module::isUniformQuantized(sliceOp.getOutput())) {
+      return failure();
+    }
+    auto p = sliceOp.parseParam();
+    uint64_t buffer_size = 0;
+    int shape_dim = module::getShape(sliceOp.getInput()).size();
+    // melloc
+    int *input_shape = new int[MAX_SHAPE_DIMS];
+    int *begin_index = new int[MAX_SHAPE_DIMS];
+    int *end_index = new int[MAX_SHAPE_DIMS];
+    int *stride = new int[MAX_SHAPE_DIMS];
+    // assign param and call func to get buffer size
+    module::getGlobalShape(sliceOp.getInput(), input_shape);
+    for (int i = 0; i < shape_dim; ++i) {
+      begin_index[i] = p.offset_4[i];
+      end_index[i] = p.os_4[i] * p.step_4[i] + p.offset_4[i];
+      stride[i] = p.step_4[i];
+    }
+    BM1684::instance().dl_nodechip_stride_slice_fix8b(
+        0, 0, 0, 0, &buffer_size, input_shape, shape_dim, STORE_MODE_4N,
+        STORE_MODE_4N, 0, 0, begin_index, end_index, stride, 0, NULL);
+    // release
+    delete[] input_shape;
+    delete[] begin_index;
+    delete[] end_index;
+    delete[] stride;
+    // create bufferOp
+    std::vector<int64_t> buffer_shape = {(int64_t)buffer_size};
+    auto type = module::getStorageType(sliceOp.getOutput());
+    auto buffer_type = RankedTensorType::get(buffer_shape, type);
+    auto buffer = tpu::BufferOp::create(sliceOp, buffer_type);
+    sliceOp.getBuffer().replaceUsesWithIf(buffer, [&](OpOperand &operand) {
+      return operand.get() == sliceOp.getBuffer();
+    });
+    return success();
+  }
+};
+
+class SoftmaxGlobalBuffer : public OpRewritePattern<tpu::SoftmaxOp> {
+public:
+  using OpRewritePattern<tpu::SoftmaxOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(tpu::SoftmaxOp softmaxOp,
+                                PatternRewriter &rewriter) const override {
+    if (!module::isNone(softmaxOp.getBuffer())) {
+      return failure();
+    }
+    if (!module::isBM1684Family()) {
+      return failure();
+    }
+    if (!module::isUniformQuantized(softmaxOp.getInput())) {
+      return failure();
+    }
+    int64_t n, c, h, w;
+    module::getNCHW(softmaxOp.getInput(), n, c, h, w);
+    std::vector<int64_t> buffer_shape = {ceiling_func(n, (int64_t)4), c, h, w};
+    auto type = module::getStorageType(softmaxOp.getOutput());
+    auto buffer_type = RankedTensorType::get(buffer_shape, type);
+    auto buffer = tpu::BufferOp::create(softmaxOp, buffer_type);
+    softmaxOp.getBuffer().replaceUsesWithIf(buffer, [&](OpOperand &operand) {
+      return operand.get() == softmaxOp.getBuffer();
+    });
+    return success();
+  }
+};
+
 class PermuteGlobalBuffer : public OpRewritePattern<tpu::PermuteOp> {
 public:
   using OpRewritePattern<tpu::PermuteOp>::OpRewritePattern;
@@ -118,21 +201,67 @@ public:
     if (!module::isNone(permuteOp.getBuffer())) {
       return failure();
     }
-    transpose_param_t param = {0};
-    param.if_getting_buffer_size = 1;
-    auto attr = permuteOp.parseParam();
-    for (int i = 0, n = attr.order_fix.size(); i < n; ++i) {
-      param.spec.order[i] = attr.order_fix[i];
-    }
     uint64_t buffer_size = 0;
-    param.buffer_size_ptr = &buffer_size;
-    auto input_spec = BM168x::get_input_spec(permuteOp);
-    auto output_spec = BM168x::get_output_spec(permuteOp);
-    BM168x::fix_shape(input_spec->at(0), attr.in_shape_fix);
-    BM168x::fix_shape(output_spec->at(0), attr.out_shape_fix);
-    BM168x::call_global_func("backend_api_transpose_global", &param,
-                             sizeof(param), input_spec->data(),
-                             output_spec->data());
+    auto attr = permuteOp.parseParam();
+    if (module::isBM1684XFamily()) {
+      transpose_param_t param = {0};
+      param.if_getting_buffer_size = 1;
+      for (int i = 0, n = attr.order_fix.size(); i < n; ++i) {
+        param.spec.order[i] = attr.order_fix[i];
+      }
+      param.buffer_size_ptr = &buffer_size;
+      auto input_spec = BM168x::get_input_spec(permuteOp);
+      auto output_spec = BM168x::get_output_spec(permuteOp);
+      BM168x::fix_shape(input_spec->at(0), attr.in_shape_fix);
+      BM168x::fix_shape(output_spec->at(0), attr.out_shape_fix);
+      BM168x::call_global_func("backend_api_transpose_global", &param,
+                               sizeof(param), input_spec->data(),
+                               output_spec->data());
+    } else if (module::isBM1684Family()) {
+      // melloc
+      uint32_t *input_shape = new uint32_t[MAX_SHAPE_DIMS];
+      int *order = new int[MAX_SHAPE_DIMS];
+      uint64_t *buffer_size_ptr = &buffer_size;
+
+      auto input = permuteOp.getInput();
+      auto output = permuteOp.getOutput();
+      i32_array_t in_order = module::getI32Array(permuteOp.getOrder());
+      auto input_addr = module::getAddress(input);
+      auto output_addr = module::getAddress(output);
+      int input_dims = module::getShape(input).size();
+      auto input_dtype = BM1684::getDataType(input);
+      auto output_dtype = BM1684::getDataType(output);
+      int type_len = BM1684::getFmtBytes(input_dtype);
+      int store_mode;
+      for (auto v : llvm::enumerate(module::getShape(input)))
+        input_shape[v.index()] = (uint32_t)v.value();
+      memcpy(order, in_order->data(), (*in_order).size() * sizeof(int));
+      if (input_dtype == DTYPE_FP32 || input_dtype == DTYPE_INT32 ||
+          input_dtype == DTYPE_UINT32) {
+        store_mode = STORE_MODE_1N;
+        BM1684::instance().dl_nodechip_transpose(
+            input_addr, output_addr, input_shape, order, input_dims, type_len,
+            store_mode, 0, buffer_size_ptr,
+            (CMD_ID_NODE *)BM1684::instance().cmdid_node);
+      } else if (input_dtype == DTYPE_INT8 || input_dtype == DTYPE_UINT8) {
+        store_mode = STORE_MODE_4N;
+        assert(output_dtype == DTYPE_INT8 || output_dtype == DTYPE_UINT8);
+        BM1684::instance().dl_nodechip_transpose_fix8b(
+            input_addr, output_addr, input_shape, order, input_dims, store_mode,
+            store_mode, 0, buffer_size_ptr,
+            (CMD_ID_NODE *)BM1684::instance().cmdid_node);
+      } else {
+        llvm_unreachable("Not Implemented");
+        return failure();
+      }
+      // release
+      delete[] input_shape;
+      delete[] order;
+      buffer_size_ptr = NULL;
+      ;
+    } else {
+      return failure();
+    }
     auto type = module::getStorageType(permuteOp.getInput());
     // add buffer
     if (buffer_size > 0) {
@@ -145,13 +274,37 @@ public:
   }
 };
 
+class NonZeroGlobalBuffer : public OpRewritePattern<tpu::NonZeroOp> {
+public:
+  using OpRewritePattern<tpu::NonZeroOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(tpu::NonZeroOp op,
+                                PatternRewriter &rewriter) const override {
+    if (!module::isNone(op.getBuffer())) {
+      return failure();
+    }
+    auto type = module::getStorageType(op.getInput());
+    // add buffer
+    auto buffer_type =
+        RankedTensorType::get(module::getShape(op.getInput()), type);
+    auto buffer = tpu::BufferOp::create(op, buffer_type);
+    op.getBuffer().replaceUsesWithIf(buffer, [&](OpOperand &operand) {
+      return operand.get() == op.getBuffer();
+    });
+    return success();
+  }
+};
+
 void populateGlobalBufferPatterns(RewritePatternSet *patterns) {
   // clang-format off
   patterns->add<
       GRUGlobalBuffer,
       LSTMGlobalBuffer,
       ReduceGlobalBuffer,
-      PermuteGlobalBuffer
+      SliceGlobalBuffer,
+      SoftmaxGlobalBuffer,
+      PermuteGlobalBuffer,
+      NonZeroGlobalBuffer
   >(patterns->getContext());
   // clang-format on
 }

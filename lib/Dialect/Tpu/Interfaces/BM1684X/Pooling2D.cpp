@@ -12,7 +12,7 @@
 #include "tpu_mlir/Support/Dnnl/Pool.h"
 #include "tpu_mlir/Support/Module.h"
 #include "tpu_mlir/Support/MathUtils.h"
-
+#include "tpu_mlir/Dialect/Tpu/Transforms/BM168x/DynCompileCommon.hpp"
 using namespace tpu_mlir::backend;
 
 
@@ -178,9 +178,8 @@ int64_t tpu::Pool2DOp::dyn_codegen_local_bm1684x(void *buffer) {
   auto gi = getGroupInfo(0, 0);
 
   spec.buffer_addr = gi.buffer_addr;
-  common.pad_h_t = (in_gi.h_idx == 0 ? attrs.pad_h : 0);
-  common.pad_h_b =
-      (in_gi.h_idx + in_gi.h_slice == attrs.ih ? attrs.pad_h_after : 0);
+  common.pad_h_t = attrs.pad_h;
+  common.pad_h_b = attrs.pad_h_after;
 
   if (getPoolMode() == tpu::PoolMode::Avg) {
     bool with_pad = has_pad(attrs) && attrs.count_include_pad == 0;
@@ -240,4 +239,8 @@ int64_t tpu::Pool2DOp::dyn_codegen_global_bm1684x(void *buffer) {
   }
 
   return BM168x::dynamic_spec_to_buffer(buffer, spec);
+}
+
+int64_t tpu::Pool2DOp::get_fw_type_bm1684x() {
+  return FW_BMNET_POOL;
 }

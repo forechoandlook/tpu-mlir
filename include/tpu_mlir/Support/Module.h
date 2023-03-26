@@ -35,9 +35,11 @@ typedef enum {
   GROUP_NORMAL = 0,
   GROUP_3D = 1,
   GROUP_SMALL_C = 2,
+  GROUP_UNSUPPORT
 } group_type_t;
 
-
+#define GDMA_MAX_C 65535
+#define MAX_SHAPE_DIMS 8
 //-----------------------------------------------------------------
 // Types
 //-----------------------------------------------------------------
@@ -71,6 +73,8 @@ void setMode(Mode mode);
 State getState();
 void setState(State state);
 bool isState(State state);
+Platform getPlatform();
+bool isPlatform(Platform plt);
 
 StringRef getWeightFile();
 void setWeightFile(StringRef weight_file);
@@ -106,6 +110,8 @@ void getNCHW(llvm::ArrayRef<int64_t> shape, int64_t &n, int64_t &c, int64_t &h,
              int64_t &w, group_type_t group_type);
 void getNCHW(Value v, int64_t &n, int64_t &c, int64_t &h, int64_t &w,
              group_type_t group_type);
+void getNCDHW(Value v, int64_t &n, int64_t &c, int64_t &d, int64_t &h,
+             int64_t &w, group_type_t group_type);
 double getDtypeSize(Value v);
 size_t getBytes(Value v);
 int64_t getNumElements(Value v);
@@ -113,9 +119,19 @@ Type getStorageType(Value v); // storage type
 Type getStorageType(Type type);
 Type getElementType(Value v);
 llvm::ArrayRef<int64_t> getShape(Value v);
+void getGlobalShape(Value v, int* shape, int dim=4);
+void getLocalShape(Value v, int64_t n_step, int64_t h_step, int* shape);
+void getLocalShape(Operation *op, int64_t n_step, int64_t h_step, int* shape);
+void get128BtyeAlignedStrideForNBit(int* stride, int* shape, int npu_num, int bit);
+void getCompactStride(int* stride, int* shape, int npu_num);
+void getContinousStride(int* stride, int* shape);
+bool isUnranked(Value v);
+void setShapeOrVerify(Value v, llvm::ArrayRef<int64_t> shape);
 bool isSign(Value v);
 bool isWeight(Value v);
+bool isAllWeight(Operation *op);
 bool isNone(Value v);
+bool isGlobalBuffer(Value v);
 FuncOp getMainFuncOp();
 i32_array_t getI32Array(ArrayAttr arrayAttr);
 i32_array_t getI32Array(llvm::Optional<ArrayAttr> arrayAttr, int64_t num_elem,
@@ -126,13 +142,15 @@ i64_array_t getI64Array(llvm::Optional<ArrayAttr> arrayAttr, int64_t num_elem,
 f64_array_t getF64Array(ArrayAttr arrayAttr);
 f64_array_t getF64Array(llvm::Optional<ArrayAttr> arrayAttr, int64_t num_elem,
                         double default_value);
-bool isOpInGroup(Operation *Op);
+bool isOpInGroup(Operation *Op, int64_t* group_type = nullptr);
 FuncOp getFuncOp(StringRef func_name);
 func::CallOp getCallOp(FuncOp func);
 llvm::StringRef getModuleName();
 llvm::StringRef getName(Operation *op, int index = 0);
 llvm::StringRef getName(Value v);
+uint32_t getIdx(Value v);
 NameLoc getLoc(Value v);
+void setLoc(Value v, NameLoc loc);
 void getInputsOutputs(std::vector<Value> &inputs, std::vector<Value> &outputs);
 void getInputsOutputs(func::CallOp call, std::vector<Value> &inputs,
                       std::vector<Value> &outputs);
@@ -142,6 +160,7 @@ bool isCV18xx();
 bool isBM1684Family();
 bool isBM1684XFamily();
 bool isBM1686();
+bool isBM1684X();
 
 //-----------------------------------------------------------------
 // Helper Functions for quantization

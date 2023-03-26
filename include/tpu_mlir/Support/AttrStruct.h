@@ -56,9 +56,6 @@ typedef struct {
   int64_t dd;
   int64_t dh;
   int64_t dw;
-  int64_t ins_d;
-  int64_t ins_h;
-  int64_t ins_w;
   int64_t pad_d;
   int64_t pad_d_after;
   int64_t pad_h;
@@ -82,6 +79,7 @@ typedef struct {
   int64_t M;
   int64_t K;
   int64_t N;
+  int64_t batch_low;
   bool with_bias;
   bool do_relu;
   double relu_limit;

@@ -592,6 +592,43 @@ void pad_tensor_for_deconv(float *p_after_pad, float *src, int n, int c, int d,
   }
 }
 
+void dilate_tensor(float *p_after_pad, float *src, int n, int c, int d, int h,
+                   int w, int pdf, int pdb, int pht, int phb, int pwl, int pwr,
+                   float pad_value, int ins_h, int ins_w, float ins_value) {
+  int nc = n * c;
+  int od = d + pdf + pdb;
+  int oh_after_ins = (h - 1) * (ins_h + 1) + 1;
+  int ow_after_ins = (w - 1) * (ins_w + 1) + 1;
+  int oh = oh_after_ins + pht + phb;
+  int ow = ow_after_ins + pwl + pwr;
+  for (int i = 0; i < nc; i++) {
+    for (int m = 0; m < od; m++) {
+      for (int j = 0; j < oh; j++) {
+        for (int k = 0; k < ow; k++) {
+          int d_offset = (i * od * oh + m * oh + j) * ow + k;
+          if (m < pdf || m >= (pdf + d) || j < pht ||
+              j >= (pht + oh_after_ins) || k < pwl ||
+              k >= (pwl + ow_after_ins)) {
+            p_after_pad[d_offset] = pad_value;
+
+          } else {
+            int h_start = j - pht;
+            int w_start = k - pwl;
+            if (h_start % (ins_h + 1) == 0 && w_start % (ins_w + 1) == 0) {
+              int s_offset =
+                  ((i * d + m - pdf) * h + h_start / (ins_h + 1)) * w +
+                  w_start / (ins_w + 1);
+              p_after_pad[d_offset] = src[s_offset];
+            } else {
+              p_after_pad[d_offset] = ins_value;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
 void tensor_sub_zp(float *tensor_after_zp, float *src, int64_t length,
                    float zero_point) {
 #pragma omp parallel for schedule(static, omp_schedule(length))
@@ -610,6 +647,22 @@ void tensor_hw_transpose(float *dst, float *src, int64_t N, int64_t C,
         int64_t d_offset = nc_offset + w * H + h;
         int64_t s_offset = nc_offset + h * W + w;
         dst[d_offset] = src[s_offset];
+      }
+    }
+  }
+}
+
+void tensor_hc_transpose(float *dst, float *src, int64_t N, int64_t C,
+                         int64_t H, int64_t W) {
+#pragma omp parallel for schedule(static, omp_schedule(N))
+  for (int64_t n = 0; n < N; ++n) {
+    for (int64_t h = 0; h < H; ++h) {
+      for (int64_t c = 0; c < C; ++c) {
+        for (int64_t w = 0; w < W; ++w) {
+          int64_t s_offset = w + h * W + c * H * W + n * C * H * W;
+          int64_t d_offset = w + c * W + h * C * W + n * C * H * W;
+          dst[d_offset] = src[s_offset];
+        }
       }
     }
   }
@@ -923,7 +976,8 @@ std::vector<int64_t> shape_expand_dim(llvm::ArrayRef<int64_t> shape, int dims) {
   return shape_v;
 }
 
-std::vector<int64_t> channel_expand_dim(llvm::ArrayRef<int64_t> shape, int dims) {
+std::vector<int64_t> channel_expand_dim(llvm::ArrayRef<int64_t> shape,
+                                        int dims) {
   int diff = dims - shape.size();
   if (diff == 0)
     return shape.vec();
@@ -1237,6 +1291,33 @@ binary_add(float *a, float *b, const llvm::ArrayRef<int64_t> &a_shape,
       .setup();
   add.run();
   return std::move(output);
+}
+
+//Accoring to output_index, get thr broadcast input_index
+int getBcastIndex(int out_index, std::vector<int64_t> &output_shape, std::vector<int64_t> &input_shape) {
+  int dim = output_shape.size();
+  std::vector<int64_t> out_slice_index(dim);
+  std::vector<int64_t> input_slice_index(dim);
+  //calculate each dim index from out_index
+  int multiplies = 1;
+  //int mod = 1;
+  int input_index = 0;
+  for (int i = dim - 1; i >= 0; i--) {
+    //mod = output_shape[i];
+    out_slice_index[i] = out_index / multiplies % output_shape[i];
+    if (input_shape[i] == 1) {
+      input_slice_index[i] = 0;
+    } else {
+      input_slice_index[i] = out_slice_index[i];
+    }
+    multiplies *= output_shape[i];
+  }
+  multiplies = 1;
+  for (int i = dim - 1; i >= 0; i--) {
+    input_index += (input_slice_index[i] * multiplies);
+    multiplies *= input_shape[i];
+  }
+  return input_index;
 }
 
 } // namespace tpu_mlir

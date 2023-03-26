@@ -9,7 +9,7 @@
 #include "tpu_mlir/Conversion/TopToTpu/LoweringBM1684.h"
 #include "tpu_mlir/Conversion/TopToTpu/LoweringBM1684X.h"
 #include "tpu_mlir/Conversion/TopToTpu/LoweringCV18xx.h"
-#include "tpu_mlir/Conversion/TopToTpu/TopToTpu.h"
+#include "tpu_mlir/Conversion/Conversion.h"
 #include "tpu_mlir/Support/Module.h"
 #include <fstream>
 #include <regex>
@@ -22,51 +22,43 @@ namespace mlir {
 
 namespace tpu_mlir {
 
-static void BackwardReshape(top::ReshapeOp op) {
-  auto in = op.getInput();
-  auto out = op.getOutput();
+template <typename OpTy> static void BackwardOp(OpTy op) {
+  Value in = op.getInput();
+  Value out = op.getOutput();
   auto in_type = in.getType().cast<RankedTensorType>();
   auto out_qtype = module::getCalibratedType(out);
   auto new_type = RankedTensorType::get(in_type.getShape(), out_qtype);
   in.setType(new_type);
+}
+
+static void Backward(Value in) {
   if (auto reshapeOp = dyn_cast<top::ReshapeOp>(in.getDefiningOp())) {
-    BackwardReshape(reshapeOp);
+    BackwardOp(reshapeOp);
+    // Backward(reshapeOp.getInput());
+  } else if (auto permuteOp = dyn_cast<top::PermuteOp>(in.getDefiningOp())) {
+    BackwardOp(permuteOp);
+    // Backward(permuteOp.getInput());
   }
 }
 
-static void ForwardReshape(top::ReshapeOp op) {
-  auto in = op.getInput();
-  auto out = op.getOutput();
+template <typename OpTy> static void ForwardOp(OpTy op) {
+  Value in = op.getInput();
+  Value out = op.getOutput();
   auto out_type = out.getType().cast<RankedTensorType>();
   auto in_qtype = module::getCalibratedType(in);
   auto new_type = RankedTensorType::get(out_type.getShape(), in_qtype);
   out.setType(new_type);
-  if (auto reshapeOp = dyn_cast<top::ReshapeOp>(in.getDefiningOp())) {
-    ForwardReshape(reshapeOp);
-  }
 }
 
-static void BackwardPermute(top::PermuteOp op) {
-  auto in = op.getInput();
-  auto out = op.getOutput();
-  auto in_type = in.getType().cast<RankedTensorType>();
-  auto out_qtype = module::getCalibratedType(out);
-  auto new_type = RankedTensorType::get(in_type.getShape(), out_qtype);
-  in.setType(new_type);
-  if (auto permuteOp = dyn_cast<top::PermuteOp>(in.getDefiningOp())) {
-    BackwardPermute(permuteOp);
-  }
-}
-
-static void ForwardPermute(top::PermuteOp op) {
-  auto in = op.getInput();
-  auto out = op.getOutput();
-  auto out_type = out.getType().cast<RankedTensorType>();
-  auto in_qtype = module::getCalibratedType(in);
-  auto new_type = RankedTensorType::get(out_type.getShape(), in_qtype);
-  out.setType(new_type);
-  if (auto permuteOp = dyn_cast<top::PermuteOp>(in.getDefiningOp())) {
-    ForwardPermute(permuteOp);
+static void Forward(Value out) {
+  for (auto user : out.getUsers()) {
+    if (auto reshapeOp = dyn_cast<top::ReshapeOp>(user)) {
+      ForwardOp(reshapeOp);
+      // Forward(reshapeOp.getOutput());
+    } else if (auto permuteOp = dyn_cast<top::PermuteOp>(user)) {
+      ForwardOp(permuteOp);
+      // Forward(permuteOp.getOutput());
+    }
   }
 }
 
@@ -98,11 +90,82 @@ struct ForwardCalibartion : public OpRewritePattern<TyOp> {
     auto out_type = out.getType().cast<RankedTensorType>();
     auto new_type = RankedTensorType::get(out_type.getShape(), in_qtype);
     out.setType(new_type);
-    if (auto reshapeOp = dyn_cast<top::ReshapeOp>(out.getDefiningOp())) {
-      ForwardReshape(reshapeOp);
-    } else if (auto permuteOp = dyn_cast<top::PermuteOp>(out.getDefiningOp())) {
-      ForwardPermute(permuteOp);
+    Forward(out);
+    return success();
+  }
+};
+
+template <typename TyOp>
+struct KeepSignPattern : public OpRewritePattern<TyOp> {
+  using OpRewritePattern<TyOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(TyOp op,
+                                PatternRewriter &rewriter) const override {
+    Value in = op.getInput();
+    Value out = op.getOutput();
+    if (!module::isCalibratedType(in, out)) {
+      return failure();
     }
+    auto in_qtype = module::getCalibratedType(in);
+    auto out_qtype = module::getCalibratedType(out);
+    float min;
+    if (in_qtype.getMin() < 0) {
+      if (out_qtype.getMin() < 0) {
+        return failure();
+      }
+      min = -out_qtype.getMax() * 0.1;
+    } else {
+      if (out_qtype.getMin() >= 0) {
+        return failure();
+      }
+      min = 0;
+    }
+    auto etype = module::getStorageType(out);
+    auto new_qtype =
+        quant::CalibratedQuantizedType::get(etype, min, out_qtype.getMax());
+    auto new_type = RankedTensorType::get(module::getShape(out), new_qtype);
+    out.setType(new_type);
+    Forward(out);
+    return success();
+  }
+};
+
+struct KeepAddSignPattern : public OpRewritePattern<top::AddOp> {
+  using OpRewritePattern<top::AddOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(top::AddOp op,
+                                PatternRewriter &rewriter) const override {
+    bool is_sign = false;
+    auto num_inputs = op.getInputs().size();
+    auto coeffs = module::getF64Array(op.getCoeff(), num_inputs, 1.0);
+    for (int i = 0; i < num_inputs; i++) {
+      auto in = op.getInputs()[i];
+      auto coeff = coeffs->at(i);
+      if (!module::isCalibratedType(in)) {
+        return failure();
+      }
+      auto in_qtype = module::getCalibratedType(in);
+      if (in_qtype.getMin() * coeff < 0 || in_qtype.getMax() * coeff < 0) {
+        is_sign = true;
+        break;
+      }
+    }
+    auto out = op.getOutput();
+    auto out_qtype = module::getCalibratedType(out);
+    double min = out_qtype.getMin();
+    if (is_sign && min >= 0) {
+      min = -out_qtype.getMax() * 0.1;
+    } else if (is_sign == false && min < 0) {
+      min = 0;
+    } else {
+      return failure();
+    }
+    auto etype = module::getStorageType(out);
+    auto new_qtype =
+        quant::CalibratedQuantizedType::get(etype, min, out_qtype.getMax());
+    auto new_type = RankedTensorType::get(module::getShape(out), new_qtype);
+    out.setType(new_type);
+    Forward(out);
     return success();
   }
 };
@@ -138,11 +201,7 @@ struct BackwardCalibartion : public OpRewritePattern<TyOp> {
     }
     auto new_type = RankedTensorType::get(in_type.getShape(), out_qtype);
     in.setType(new_type);
-    if (auto reshapeOp = dyn_cast<top::ReshapeOp>(in.getDefiningOp())) {
-      BackwardReshape(reshapeOp);
-    } else if (auto permuteOp = dyn_cast<top::PermuteOp>(in.getDefiningOp())) {
-      BackwardPermute(permuteOp);
-    }
+    Backward(in);
     return success();
   }
 };
@@ -252,12 +311,7 @@ struct BackwardMutiInSingleOut : public OpRewritePattern<TyOp> {
       auto in_type = in.getType().cast<RankedTensorType>();
       auto new_type = RankedTensorType::get(in_type.getShape(), out_qtype);
       in.setType(new_type);
-      if (auto reshapeOp = dyn_cast<top::ReshapeOp>(in.getDefiningOp())) {
-        BackwardReshape(reshapeOp);
-      } else if (auto permuteOp =
-                     dyn_cast<top::PermuteOp>(in.getDefiningOp())) {
-        BackwardPermute(permuteOp);
-      }
+      Backward(in);
     }
     return success();
   }
@@ -375,6 +429,11 @@ protected:
       // TODO: support asymmetric mode
       patterns.add<ForwardCalibartion<top::AvgPoolOp>>(ctx_);
     }
+    applyPatternsAndFoldGreedily(module_, std::move(patterns));
+    // keep sign for some ops
+    // backend not support in out not the same sign
+    patterns.clear();
+    patterns.add<KeepSignPattern<top::AvgPoolOp>, KeepAddSignPattern>(ctx_);
     applyPatternsAndFoldGreedily(module_, std::move(patterns));
   }
 
@@ -531,7 +590,7 @@ protected:
         builder.getNamedAttr("param", builder.getDictionaryAttr(param)));
     auto castOp = builder.create<tpu::GenericCpuOp>(
         loc, newType, ValueRange{v}, ArrayRef<NamedAttribute>{attrs});
-    return castOp.getOutput();
+    return castOp.getOutputs()[0];
   }
 
   static module::Mode qmode(const std::string &mode) {

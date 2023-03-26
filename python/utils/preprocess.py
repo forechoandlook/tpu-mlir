@@ -94,7 +94,7 @@ def add_preprocess_parser(parser):
     parser.add_argument("--keep_aspect_ratio", action='store_true', default=False,
                         help="Resize image by keeping same ratio, any areas which" +
                              "are not taken are filled with 0")
-    parser.add_argument("--mean", default='0,0,0',
+    parser.add_argument("--mean", default='0,0,0', nargs='?',
                         help="Per Channel image mean values")
     parser.add_argument("--scale", default='1,1,1',
                         help="Per Channel image scale values")
@@ -109,6 +109,9 @@ def add_preprocess_parser(parser):
     parser.add_argument("--debug_cmd", type=str, default='', help="debug cmd")
     parser.add_argument("--model_format", choices=['image', 'nlp'], default='image',
                         help='image or nlp')
+    avoid_opts = parser.add_argument_group('avoid options')
+    avoid_opts.add_argument('unknown_params', nargs='?', default=[], help='not parameters but starting with "-"')
+
     return parser
 
 
@@ -126,17 +129,16 @@ class preprocess(object):
     def __init__(self, debug_cmd=''):
         self.debug_cmd = debug_cmd
         self.fuse_pre = False
+        self.has_pre = False
         pass
 
     def config(self, resize_dims=None, keep_aspect_ratio=False, customization_format = None, fuse_pre = False, aligned = False,
                mean='0,0,0', scale='1,1,1', pixel_format='bgr', pad_type='center', pad_value=0, chip = "",
-               channel_format='nchw', debug_cmd='', input_shapes=None, model_format='image', **ignored):  # add input_shapes for model_eval.py by wangxuechuan 20221110
+               channel_format='nchw', debug_cmd='', input_shapes=None, model_format='image', unknown_params=[], **ignored):  # add input_shapes for model_eval.py by wangxuechuan 20221110
         if self.debug_cmd == '':
             self.debug_cmd = debug_cmd
-        if input_shapes is None:
-            print(
-                'you must set input_shapes if you call preprocess.config, please add, for example:input_shapes=[[1,3,224,224]]')
-            exit(0)
+        if input_shapes is None or input_shapes == []:
+            return
         if isinstance(input_shapes, str):
             input_shapes = str2shape(input_shapes)
         self.batch_size = input_shapes[0][0]
@@ -170,7 +172,10 @@ class preprocess(object):
         elif self.pixel_format == 'rgba':
             self.channel_num = 4
 
-        self.mean = np.array([float(s)
+        if unknown_params:
+            self.mean = np.array([float(s) for sublist in unknown_params for s in sublist.split(',')], dtype=np.float32)
+        else:
+            self.mean = np.array([float(s)
                              for s in mean.split(',')], dtype=np.float32)
         self.mean = self.mean[np.newaxis, :, np.newaxis, np.newaxis]
         assert (self.mean.size >= self.channel_num)
@@ -182,6 +187,7 @@ class preprocess(object):
         self.aligned = aligned
         self.customization_format = customization_format
         self.fuse_pre = fuse_pre
+        self.has_pre = True
         #fuse_preprocess for cv18xx
         if self.fuse_pre:
             #resize_dims should be greater than net_input_dims
@@ -231,6 +237,7 @@ class preprocess(object):
         logger.info(info_str)
 
     def load_config(self, input_op):
+        self.input_name = Operation.name(input_op)
         shape = Operation.shape(input_op)
         self.net_input_dims = []
         if len(shape) >= 3:
@@ -241,10 +248,7 @@ class preprocess(object):
             self.net_input_dims = shape[0:]
             self.batch_size = shape[0]
         else:
-            print('error, len(input_op.shape) < 3, maybe have some error')
-            exit(1)
-
-        self.input_name = Operation.name(input_op)
+            return
         attrs = input_op.attributes
         if len(attrs) == 0:
             return
@@ -272,7 +276,7 @@ class preprocess(object):
             attrs['scale'])).astype(np.float32)
         self.scale = self.scale[np.newaxis, :, np.newaxis, np.newaxis]
         self.crop_method = 'center'
-
+        self.has_pre = True
         format_str = "\n  load_config Preprocess args : \n" + \
             "\tresize_dims           : {}\n" + \
             "\tkeep_aspect_ratio     : {}\n" + \
@@ -295,6 +299,8 @@ class preprocess(object):
                                       self.model_format))
 
     def to_dict(self):
+        if not self.has_pre:
+            return {}
         return {
             'resize_dims': self.resize_dims,
             'keep_aspect_ratio': self.keep_aspect_ratio,

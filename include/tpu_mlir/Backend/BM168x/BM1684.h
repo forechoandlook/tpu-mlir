@@ -34,6 +34,11 @@ typedef void (*nodechip_bnscale_fix8b_forward_local)(int bottom_local_offset, in
 typedef void (*nodechip_scale_forward_local)(int bottom_local_offset, int scale_local_offset, int bias_local_offset, int top_local_offset, int *tensor_dim, int *scale_dim, int bias_term, int if_relu, float upper_limit, int is_scale_unaligned, int is_bias_unaligned, void *id_node);
 typedef void (*nodechip_eltwise_forward_local)(int *bottom_local_offset, int top_local_offset, int tensor_n, int tensor_c, int tensor_h, int tensor_w, int *bottom_local_cstride, int bottom_cstride_en, int op_code, float *bottom_coeff, int bottom_num, int if_relu, void *id_node);
 typedef void (*nodechip_eltwise_fix8b_forward_local)(int *bottom_local_offset, int top_local_offset, int imm_buffer_local_offset, int tensor_n, int tensor_c, int tensor_h, int tensor_w, int *bottom_local_cstride, int bottom_cstride_en, int op_code, int *scale_weight, int *rshift_num, int *bottom_sign, int bottom_num, int if_relu, void *id_node);
+typedef void (*nodechip_broadcast_binary_fix8b_forward_parallel)(uint64_t bottom_A_global_addr, uint64_t bottom_B_global_addr, uint64_t top_global_addr, int *b0_shape, int *b1_shape, int tensor_dim, bool a_is_coeff, bool b_is_coeff, int op_code, int scale_A, int scale_B, int rshift_A, int rshift_B, int* is_int8, int* is_sign, int if_relu, void *id_node);
+typedef void (*nodechip_broadcast_binary)(uint64_t bottom0_global_addr, int* bottom0_shape, uint64_t bottom1_global_addr, int* bottom1_shape, uint64_t top_global_addr, int binary_op, int if_relu, float relu_limit, CMD_ID_NODE* pid_node, int calc_from_int32);
+typedef void (*nodechip_broadcast_binary_local)(uint32_t bottom0_lo, int *bottom0_shape, int *bottom0_stride, uint32_t bottom1_lo, int *bottom1_shape, int *bottom1_stride, uint32_t top_lo, int* top_stride, int binary_op, int if_relu, float relu_limit, uint32_t cdim_lo, void* pid_node);
+typedef void (*nodechip_broadcast_binary_fix8b_forward_local)(uint32_t bottom0_lo, uint32_t bottom1_lo, uint32_t top_lo, uint32_t buffer_local_offset, int* b0_shape, int* b1_shape, int tensor_dim, int a_is_coeff, int b_is_coeff, int op_code, int scale_A, int scale_B, int rshift_A, int rshift_B, int* is_int8, int* is_sign, int if_relu, void* id_node);
+typedef void (*nodechip_broadcast_binary_full)(uint64_t bottom0_global_addr, uint32_t *bottom0_shape, int bottom0_dim, uint64_t bottom1_global_addr, uint32_t *bottom1_shape, int bottom1_dim, uint64_t top_global_addr, uint64_t buffer_global_addr, int binary_op, int if_relu, float relu_limit, int data_format, CMD_ID_NODE* pid_node, int calc_from_int32);
 typedef void (*nodechip_fc_forward_local)(int bottom_local_offset, int weight_local_offset, int bias_local_offset, int top_local_offset, int slope_local_offset, int imm_buffer_offset, int *bottom_dim, int output_num, int using_bias, int active_type, int channel_shared, float shared_slope, void *id_node);
 typedef void (*nodechip_prelu_forward_local_v2)(int bottom_local_offset, int top_local_offset, int slope_local_offset, int buffer_local_offset, int channel_shared, float shared_slope, int *tensor_dim, int st_by_fcway, void *id_node);
 typedef void (*nodechip_relu_forward_local)(int bottom_local_offset, int top_local_offset, int *tensor_dim, float upper_limit, void *id_node);
@@ -166,9 +171,13 @@ typedef void (*nodechip_pad_fix8b_local)(int input_local_offset, int output_loca
 typedef void (*nodechip_concat_local_v2)(uint32_t *p_bottom_local_offset, uint32_t top_local_offset, int **bottom_dim, int bottom_num, int *is_st_concat_way, int *top_dim, int concat_axis, void *id_node, void *id_node_gdma);
 typedef void (*nodechip_concat_fix8b_local_v2)(uint32_t *p_bottom_local_offset, uint32_t top_local_offset, int **bottom_dim, int bottom_num, int *is_st_concat_way, int *top_dim, int concat_axis, void *id_node, void *id_node_gdma);
 typedef void (*nodechip_const_binary)(uint64_t bottom_global_addr, uint64_t length, float bottom_val, uint64_t top_global_addr, int binary_op, int inversed, int if_relu, float relu_limit, CMD_ID_NODE *pid_node, int input_is_int32);
-typedef void (*nodechip_global_int2float)(uint64_t bottom_global_offset, uint64_t top_global_offset, int input_n, int input_c, int input_h, int input_w, int sign_unsign, TENSOR_STORAGE_MODE mode, CMD_ID_NODE* id_node);
-typedef void (*nodechip_float2int8_v2)(uint64_t A_global_offset, uint64_t R_global_offset, int input_n, int input_c, int input_h, int input_w, int sign_unsign, TENSOR_STORAGE_MODE stmode, ROUND_MODE_T round_mode, CMD_ID_NODE* id_node);
+typedef void (*nodechip_global_int2float)(uint64_t bottom_global_offset, uint64_t top_global_offset, int input_n, int input_c, int input_h, int input_w, int sign_unsign, float out_scale, TENSOR_STORAGE_MODE mode, CMD_ID_NODE* id_node);
+typedef void (*nodechip_float2int8_v2)(uint64_t A_global_offset, uint64_t R_global_offset, int input_n, int input_c, int input_h, int input_w, int sign_unsign, float A_scale, TENSOR_STORAGE_MODE stmode, ROUND_MODE_T round_mode, CMD_ID_NODE* id_node);
 typedef void (*nodechip_const_binary_local)(uint32_t bottom0_lo, uint32_t *bottom0_shape, float bottom1_val, uint32_t top_lo, int binary_op, int inversed, int if_relu, float relu_limit, CMD_ID_NODE *pid_node);
+typedef void (*nodechip_transpose)(uint64_t input_global_addr, uint64_t output_global_addr, const uint32_t* input_shape, const int* order, int dims, int type_len, int store_mode, uint64_t buffer_global_addr, uint64_t *buffer_size, CMD_ID_NODE* pid_node);
+typedef void (*nodechip_transpose_fix8b)(uint64_t input_global_addr, uint64_t output_global_addr, const uint32_t* input_shape, const int* order, int dims, int in_store_mode, int out_store_mode, uint64_t buffer_global_addr, uint64_t* buffer_size, CMD_ID_NODE* pid_node);
+typedef void (*nodechip_float2int8_local_keep_input)(uint32_t tensorA_addr, uint32_t tensorO_addr, uint32_t intermediate_addr, int tensorA_n, int tensorA_c, int tensorA_h, int tensorA_w, int sign_unsign, int int8_stmode, ROUND_MODE_T round_mode, void *id_node);
+typedef void (*tensor_int8_to_float_local_v2)(int input_offset, int output_offset, int imm_offset, int n, int c, int h, int w, bool keep_input, int sign_unsign, TENSOR_STORAGE_MODE mode, void* id_node);
 
 // clang-format on
 namespace tpu_mlir {
@@ -221,6 +230,11 @@ public:
   nodechip_normalize_fix8b_forward_local dl_nodechip_normalize_fix8b_forward_local;
   nodechip_active_forward_local dl_nodechip_active_forward_local;
   nodechip_mulshift_fix8b_forward_local dl_nodechip_mulshift_fix8b_forward_local;
+  nodechip_broadcast_binary_fix8b_forward_parallel dl_nodechip_broadcast_binary_fix8b_forward_parallel;
+  nodechip_broadcast_binary dl_nodechip_broadcast_binary;
+  nodechip_broadcast_binary_local dl_nodechip_broadcast_binary_local;
+  nodechip_broadcast_binary_fix8b_forward_local dl_nodechip_broadcast_binary_fix8b_forward_local;
+  nodechip_broadcast_binary_full dl_nodechip_broadcast_binary_full;
   nodechip_concat_md dl_nodechip_concat_md;
   nodechip_concat_md_fix8b dl_nodechip_concat_md_fix8b;
   nodechip_stride_slice_forward_local dl_nodechip_stride_slice_forward_local;
@@ -343,6 +357,10 @@ public:
   nodechip_global_int2float dl_nodechip_global_int2float;
   nodechip_float2int8_v2 dl_nodechip_float2int8_v2;
   nodechip_const_binary_local dl_nodechip_const_binary_local;
+  nodechip_transpose dl_nodechip_transpose;
+  nodechip_transpose_fix8b dl_nodechip_transpose_fix8b;
+  nodechip_float2int8_local_keep_input dl_nodechip_float2int8_local_keep_input;
+  tensor_int8_to_float_local_v2 dl_tensor_int8_to_float_local_v2;
   // clang-format on
 public:
   virtual uint32_t get_bdc_len(int bdc_num, int group_id) override;

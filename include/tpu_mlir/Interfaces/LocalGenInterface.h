@@ -28,6 +28,7 @@ typedef struct {
   int64_t h_slice;
   int64_t id;
   int64_t stage;
+  int64_t type;
   bool eu_align;
   bool overstepped;
 } group_info_t;
@@ -56,6 +57,8 @@ typedef struct local_sec_info {
 #ifdef __cplusplus
 }
 #endif
+
+mlir::LogicalResult BroadCastBinaryLocalGenSupport(mlir::Operation *op);
 
 } // namespace tpu_mlir
 

@@ -9,18 +9,20 @@
 
 #pragma once
 
-#include <stdint.h>
-#include <vector>
-#include <string>
+#include "bmcpu_common.h"
+#include "tpu_mlir/Dialect/Tpu/IR/TpuOps.h"
+#include <algorithm>
 #include <map>
 #include <math.h>
-#include <algorithm>
+#include <stdint.h>
+#include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace tpu_mlir {
 #define MAX_DET 200
 #define MAX_DET_RAW 500
-#define KEEP_TOP_K    200
+#define KEEP_TOP_K 200
 enum Decode_CodeType {
   PriorBoxParameter_CodeType_CORNER = 1,
   PriorBoxParameter_CodeType_CENTER_SIZE = 2,
@@ -90,12 +92,14 @@ struct DetParam {
   double confidence_threshold;
   bool share_location;
   Decode_CodeType code_type;
+  int onnx_nms;
 };
 
 class DetectionOutputFunc {
 public:
   DetectionOutputFunc(DetParam &param);
   void invoke();
+
 private:
   DetParam param_;
 };
@@ -122,6 +126,7 @@ class YoloDetectionFunc {
 public:
   YoloDetectionFunc(YoloDetParam &param);
   void invoke();
+
 private:
   YoloDetParam param_;
   std::vector<float> _anchors;
@@ -141,6 +146,7 @@ class Yolo_v2_DetectionFunc {
 public:
   Yolo_v2_DetectionFunc(YoloDetParam &param);
   void invoke();
+
 private:
   YoloDetParam param_;
   std::vector<float> _anchors;
@@ -162,6 +168,7 @@ class ProposalFunc {
 public:
   ProposalFunc(ProposalParam &param);
   void invoke();
+
 private:
   ProposalParam param_;
   std::vector<float> anchor_scale = {8, 16, 32};
@@ -181,6 +188,7 @@ class ROIPoolingFunc {
 public:
   ROIPoolingFunc(ROIPoolingParam &param);
   void invoke();
+
 private:
   ROIPoolingParam param_;
 };
@@ -198,6 +206,7 @@ class FrcnDetctionFunc {
 public:
   FrcnDetctionFunc(FrcnDetParam &param);
   void invoke();
+
 private:
   FrcnDetParam param_;
 };
@@ -222,6 +231,7 @@ class RoiAlignFunc {
 public:
   RoiAlignFunc(RoiAlignParam &param);
   void invoke();
+
 private:
   RoiAlignParam param_;
 };
@@ -230,8 +240,8 @@ float my_mish_activate(float x_val);
 
 struct AnchorCfg {
 public:
-  AnchorCfg(int stride, std::vector<int> scales, int base_size, std::vector<float> ratios,
-            int allowed_border)
+  AnchorCfg(int stride, std::vector<int> scales, int base_size,
+            std::vector<float> ratios, int allowed_border)
       : stride(stride), scales(scales), base_size(base_size), ratios(ratios),
         allowed_border(allowed_border) {}
 
@@ -285,8 +295,8 @@ public:
   }
 
   ~RetinaFaceDetectionFunc() = default;
-  void setup(std::vector<tensor_list_t> &inputs,
-             tensor_list_t &output, RetinaFaceDetectionParam &param);
+  void setup(std::vector<tensor_list_t> &inputs, tensor_list_t &output,
+             RetinaFaceDetectionParam &param);
   void invoke();
 
 private:
@@ -308,7 +318,8 @@ private:
     return anchor;
   }
 
-  std::vector<AnchorBox> ratio_enum(AnchorBox &base_anchor, std::vector<float> &ratios) {
+  std::vector<AnchorBox> ratio_enum(AnchorBox &base_anchor,
+                                    std::vector<float> &ratios) {
     std::vector<AnchorBox> anchors;
     for (size_t i = 0; i < ratios.size(); ++i) {
       AnchorCenter ctr = mkcenter(base_anchor);
@@ -323,7 +334,8 @@ private:
     return anchors;
   }
 
-  std::vector<AnchorBox> scale_enum(AnchorBox anchor, std::vector<int> &scales) {
+  std::vector<AnchorBox> scale_enum(AnchorBox anchor,
+                                    std::vector<int> &scales) {
     std::vector<AnchorBox> anchors;
     for (size_t i = 0; i < scales.size(); ++i) {
       auto ctr = mkcenter(anchor);
@@ -393,7 +405,8 @@ private:
     return anchors;
   }
 
-  std::vector<float> bbox_pred(AnchorBox anchor, std::vector<float> bbox_deltas) {
+  std::vector<float> bbox_pred(AnchorBox anchor,
+                               std::vector<float> bbox_deltas) {
     std::vector<float> bbox(4, 0);
 
     float width = anchor.x2 - anchor.x1 + 1;
@@ -414,7 +427,8 @@ private:
     return bbox;
   }
 
-  std::vector<float> landmark_pred(AnchorBox anchor, std::vector<float> landmark_deltas) {
+  std::vector<float> landmark_pred(AnchorBox anchor,
+                                   std::vector<float> landmark_deltas) {
     std::vector<float> pts(10, 0);
 
     float width = anchor.x2 - anchor.x1 + 1;
@@ -497,6 +511,72 @@ private:
   std::unordered_map<std::string, int> _num_anchors;
   std::vector<AnchorCfg> _cfg;
   std::vector<int> _feature_stride_fpn{32, 16, 8};
+};
+
+class BMCpuOp {
+public:
+  BMCpuOp(tpu::GenericCpuOp &op);
+  ~BMCpuOp() { param = NULL; }
+  int op_type;
+  int param_size;
+  void *param;
+
+private:
+  std::string op_name;
+  int getCpuOpType();
+  void getCpuParam();
+  tpu::GenericCpuOp op_;
+  void get_topk_param();
+};
+
+struct InstanceNormParam {
+  std::vector<tensor_list_t> inputs;
+  tensor_list_t output;
+  float eps;
+};
+
+class InstanceNormFunc {
+public:
+  InstanceNormFunc(InstanceNormParam &param);
+  void invoke();
+
+private:
+  InstanceNormParam param_;
+};
+
+struct InterpParam {
+  std::vector<tensor_list_t> inputs;
+  tensor_list_t output;
+  int64_t height;
+  int64_t width;
+  int64_t pad_beg;
+  int64_t pad_end;
+  int64_t shrink_factor;
+  int64_t zoom_factor;
+  std::string coordinate_transformation_mode;
+};
+
+class InterpFunc {
+public:
+  InterpFunc(InterpParam &param);
+  void invoke();
+
+private:
+  InterpParam param_;
+};
+
+struct EmbeddingParam {
+  std::vector<tensor_list_t> inputs;
+  tensor_list_t output;
+};
+
+class EmbeddingFunc {
+public:
+  EmbeddingFunc(EmbeddingParam &param);
+  void invoke();
+
+private:
+  EmbeddingParam param_;
 };
 
 } // namespace tpu_mlir

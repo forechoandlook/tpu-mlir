@@ -12,10 +12,8 @@
 #include "tpu_mlir/Support/Module.h"
 #include "tpu_mlir/Support/MathUtils.h"
 
-
-
 int64_t top::AddConstOp::getFLOPs() {
-  return module::getNumElements(getOutput()) * (1 + getDoRelu() ? 1 : 0);
+  return module::getNumElements(getOutput()) * (1 + (getDoRelu() ? 1 : 0));
 }
 
 LogicalResult top::AddConstOp::init(InferenceParameter &p) { return success(); }
@@ -33,4 +31,8 @@ LogicalResult top::AddConstOp::inference(InferenceParameter &p) {
     function_relu(p.outputs[0], p.outputs[0], num_elem, limit);
   }
   return success();
+}
+
+void top::AddConstOp::shape_inference() {
+  common_shape_inference(getOperation());
 }

@@ -7,16 +7,47 @@
 //
 //===----------------------------------------------------------------------===//
 #include "ConvUtils.h"
-#include "tpu_mlir/Dialect/Tpu/IR/TpuOps.h"
 #include "tpu_mlir/Backend/BM168x/BM1684X.h"
 #include "tpu_mlir/Dialect/Tpu/IR/TpuOps.h"
-
+#include "tpu_mlir/Dialect/Tpu/Transforms/BM168x/DynCompileCommon.hpp"
 #include "tpu_mlir/Dialect/Tpu/Transforms/BM168x/WeightReorder.h"
 #include "tpu_mlir/Support/MathUtils.h"
 #include "tpu_mlir/Support/Module.h"
 
 using namespace tpu_mlir::backend;
 using namespace tpu_mlir::bm1684x;
+
+static LogicalResult
+canonicalize_matmul_operand_shape(tpu::MatMulOp op, PatternRewriter &rewriter) {
+  auto left_shape = module::getShape(op.getInput());
+  auto right_shape = module::getShape(op.getRight());
+  auto res = failure();
+  // modify right shape from (K, N) to (1, K, N) if left is (B, M, K)
+  if (isa<top::WeightOp>(op.getRight().getDefiningOp())) {
+    if (left_shape.size() == 3 && right_shape.size() == 2) {
+      std::vector<int64_t> new_shape{1, right_shape[0], right_shape[1]};
+      auto newType = RankedTensorType::get(
+          new_shape, module::getElementType(op.getRight()));
+      op.getRight().setType(newType);
+    }
+    res = success();
+  }
+  // if left_transpose, bias_shape = (1, X, 1, 1)
+  // if !left_transpose, bias_shape = (1, 1, 1, X)
+  if (isa<top::WeightOp>(op.getBias().getDefiningOp())) {
+    auto bias_shape = module::getShape(op.getBias());
+    if (bias_shape.size() == 1) {
+      std::vector<int64_t> new_shape(4, 1);
+      new_shape[(op.getLeftTranspose() ? 1 : 3)] = bias_shape[0];
+      auto newType = RankedTensorType::get(
+          new_shape, module::getElementType(op.getBias()));
+      op.getBias().setType(newType);
+    }
+    res = success();
+  }
+
+  return res;
+}
 
 template <>
 LogicalResult WeightReorder<tpu::MatMulOp, int8_t>::matchAndRewrite(
@@ -29,46 +60,60 @@ LogicalResult WeightReorder<tpu::MatMulOp, int8_t>::matchAndRewrite(
   if (p.input_zp == 0) {
     auto in_stype = module::getStorageType(op.getInput());
     bool isINT4MM = in_stype.isInteger(4);
-    if(isINT4MM){
-    // filter
-    auto filterOp = dyn_cast<top::WeightOp>(op.getRight().getDefiningOp());
+    if (isINT4MM) {
+      // filter
+      auto filterOp = dyn_cast<top::WeightOp>(op.getRight().getDefiningOp());
 
-    auto filter_i8 = filterOp.read<int8_t>();
-    std::vector<int64_t> filter_shape; // = {1, p.K, 1, p.N};
-    auto  shape = module::getShape(op.getRight());
-    for(int i = 0; i < shape.size(); ++i){
-      filter_shape[i] = shape[i];
-    }
+      auto filter_i8 = filterOp.read<int8_t>();
+      std::vector<int64_t> filter_shape; // = {1, p.K, 1, p.N};
+      auto shape = module::getShape(op.getRight());
+      for (int i = 0; i < shape.size(); ++i) {
+        filter_shape[i] = shape[i];
+      }
 
-    tpu::compact_coeff_for_int4(filter_i8, filter_shape, false);
-    bool sign = true;
-    auto new_type = RankedTensorType::get(filter_shape, rewriter.getIntegerType(4, sign));
-    op.getRight().setType(new_type);
-    }
-    return failure();
-  }
-  i32_array_t bias_quant;
-  if (isa<top::WeightOp>(op.getBias().getDefiningOp())) {
-    bias_quant =
-        cast<top::WeightOp>(op.getBias().getDefiningOp()).read<int32_t>();
-    for (size_t i = 0; i < p.N; ++i) {
-      bias_quant->data()[i] += p.input_zp * p.right_zp * p.K;
+      tpu::compact_coeff_for_int4(filter_i8, filter_shape, false);
+      bool sign = true;
+      auto new_type =
+          RankedTensorType::get(filter_shape, rewriter.getIntegerType(4, sign));
+      op.getRight().setType(new_type);
     }
   } else {
-    bias_quant = i32_array_t(new std::vector<int32_t>(p.N, 0));
-    for (size_t i = 0; i < p.N; ++i) {
-      bias_quant->data()[i] += p.input_zp * p.right_zp * p.K;
+    i32_array_t bias_quant;
+    if (isa<top::WeightOp>(op.getBias().getDefiningOp())) {
+      bias_quant =
+          cast<top::WeightOp>(op.getBias().getDefiningOp()).read<int32_t>();
+      for (size_t i = 0; i < p.N; ++i) {
+        bias_quant->data()[i] += p.input_zp * p.right_zp * p.K;
+      }
+    } else {
+      bias_quant = i32_array_t(new std::vector<int32_t>(p.N, 0));
+      for (size_t i = 0; i < p.N; ++i) {
+        bias_quant->data()[i] += p.input_zp * p.right_zp * p.K;
+      }
+      auto stype = module::getStorageType(op.getBias());
+      int64_t left_num_dims = module::getShape(op.getInput()).size();
+      std::vector<int64_t> bias_shape(left_num_dims, 1);
+      bias_shape[left_num_dims - 1] = p.N;
+      auto new_type = RankedTensorType::get(bias_shape, rewriter.getI32Type());
+      auto new_op =
+          top::WeightOp::create(op, "bias_merge_izp", *bias_quant, new_type);
+      op->setOperand(2, new_op);
     }
-    auto stype = module::getStorageType(op.getBias());
-    int64_t left_num_dims = module::getShape(op.getInput()).size();
-    std::vector<int64_t> bias_shape(left_num_dims, 1);
-    bias_shape[left_num_dims - 1] = p.N;
-    auto new_type = RankedTensorType::get(bias_shape, rewriter.getI32Type());
-    auto new_op =
-        top::WeightOp::create(op, "bias_merge_izp", *bias_quant, new_type);
-    op->setOperand(2, new_op);
   }
+  canonicalize_matmul_operand_shape(op, rewriter);
   return success();
+}
+
+template <>
+LogicalResult WeightReorder<tpu::MatMulOp, BFloat16Type>::matchAndRewrite(
+    tpu::MatMulOp op, PatternRewriter &rewriter) const {
+  return canonicalize_matmul_operand_shape(op, rewriter);
+}
+
+template <>
+LogicalResult WeightReorder<tpu::MatMulOp, Float16Type>::matchAndRewrite(
+    tpu::MatMulOp op, PatternRewriter &rewriter) const {
+  return canonicalize_matmul_operand_shape(op, rewriter);
 }
 
 void tpu::MatMulOp::codegen_global_bm1684x() {
@@ -76,20 +121,22 @@ void tpu::MatMulOp::codegen_global_bm1684x() {
   auto op = getOperation();
   auto input_spec = BM168x::get_input_spec(op);
   auto output_spec = BM168x::get_output_spec(op);
-  if (p.batch != 1) {
-    BM168x::fix_shape(input_spec->at(0), {p.batch, p.M, p.K});
-    if (p.right_transpose == false) {
-      BM168x::fix_shape(input_spec->at(1), {p.batch, p.K, p.N});
-    } else {
-      BM168x::fix_shape(input_spec->at(1), {p.batch, p.N, p.K});
+  if (p.hdim_is_batch || p.batch != 1) {
+    if (!p.hdim_is_batch) {
+      BM168x::fix_shape(input_spec->at(0), {p.batch, p.M, p.K});
+      if (p.right_transpose == false) {
+        BM168x::fix_shape(input_spec->at(1), {p.batch, p.K, p.N});
+      } else {
+        BM168x::fix_shape(input_spec->at(1), {p.batch, p.N, p.K});
+      }
+      BM168x::fix_shape(output_spec->at(0), {p.batch, p.M, p.N});
     }
-    BM168x::fix_shape(output_spec->at(0), {p.batch, p.M, p.N});
     batch_matmul_common_spec_t spec{0};
     spec.Y_dtype = output_spec->at(0).dtype;
-    spec.L_trans = false;
+    spec.L_trans = p.left_transpose;
     spec.R_trans = p.right_transpose;
     spec.has_bias = p.with_bias;
-    spec.hdim_is_batch = false;
+    spec.hdim_is_batch = p.hdim_is_batch;
     spec.requant_mode = -1;
     if (module::isUniformQuantized(getInput())) {
       spec.R_zp_is_const = true;
@@ -237,9 +284,11 @@ int64_t tpu::MatMulOp::getBufferSize_bm1684x(
     buffer_size += sizeof(int32_t) * ceiling_func(oshape[1], BM168x::NPU_NUM) *
                    align_up(oshape[3], BM168x::eu_num(sizeof(int32_t)));
   }
+
   if (p.input_zp != 0) {
     buffer_size +=
-        align_up(w1, BM168x::eu_num(sizeof(int32_t))) * sizeof(int32_t);
+        align_up(p.hdim_is_batch ? w1 : h1, BM168x::eu_num(sizeof(int32_t))) *
+        sizeof(int32_t);
   }
 
   return buffer_size;
@@ -252,15 +301,16 @@ void tpu::MatMulOp::codegen_local_bm1684x(int64_t n_step, int64_t h_step,
   auto op = getOperation();
   auto input_spec = BM168x::get_input_spec(op, group_type);
   auto output_spec = BM168x::get_output_spec(op, group_type);
-  // const auto &gi = getGroupInfo(n_step, h_step);
+  const auto &gi = getGroupInfo(n_step, h_step);
 
   batch_matmul_local_spec_t param{0};
+  param.buffer_addr = gi.buffer_addr;
   auto &common = param.common;
   common.Y_dtype = output_spec->at(0).dtype;
-  common.L_trans = getLeftTranspose();
+  common.L_trans = p.left_transpose;
   common.R_trans = p.right_transpose;
   common.has_bias = p.with_bias;
-  common.hdim_is_batch = false;
+  common.hdim_is_batch = p.hdim_is_batch;
   common.requant_mode = -1;
   if (module::isUniformQuantized(getInput())) {
     common.R_zp_is_const = true;
@@ -287,4 +337,84 @@ void tpu::MatMulOp::codegen_local_bm1684x(int64_t n_step, int64_t h_step,
 // ======================================
 // Dynamic GlobalGenInterface
 // ======================================
-int64_t tpu::MatMulOp::dyn_codegen_global_bm1684x(void *buffer) { return 0; }
+int64_t tpu::MatMulOp::dyn_codegen_global_bm1684x(void *buffer) {
+  auto p = parseParam();
+  if (!buffer)
+    return (p.batch != 1 ? sizeof(batch_matmul_common_spec_t)
+                         : sizeof(fc_global_spec_t));
+  auto op = getOperation();
+  auto input_spec = BM168x::get_input_spec(op);
+  auto output_spec = BM168x::get_output_spec(op);
+  if (p.batch != 1) {
+    BM168x::fix_shape(input_spec->at(0), {p.batch, p.M, p.K});
+    if (p.right_transpose == false) {
+      BM168x::fix_shape(input_spec->at(1), {p.batch, p.K, p.N});
+    } else {
+      BM168x::fix_shape(input_spec->at(1), {p.batch, p.N, p.K});
+    }
+    BM168x::fix_shape(output_spec->at(0), {p.batch, p.M, p.N});
+    batch_matmul_common_spec_t spec{0};
+    spec.Y_dtype = output_spec->at(0).dtype;
+    spec.L_trans = false;
+    spec.R_trans = p.right_transpose;
+    spec.has_bias = p.with_bias;
+    spec.hdim_is_batch = false;
+    spec.requant_mode = -1;
+    if (module::isUniformQuantized(getInput())) {
+      spec.R_zp_is_const = true;
+      spec.R_zp_const_val = p.right_zp;
+      spec.izp_const_val = p.input_zp;
+      if (module::isUniformQuantized(getOutput())) {
+        spec.requant_mode = static_cast<int>(getQuantMode());
+        auto rshift_v = module::getI64Array(getRshifts(), 1, 0);
+        auto multiplier_v = module::getI64Array(getMultipliers(), 1, 1);
+        assert(rshift_v->size() == 1);
+        assert(multiplier_v->size() == 1);
+        spec.mul_val = multiplier_v->at(0);
+        spec.shift_val = -rshift_v->at(0);
+        auto output_type = module::getUniformQuantizedType(getOutput());
+        spec.offset_val = output_type.getZeroPoint();
+      }
+    }
+    return BM168x::dynamic_spec_to_buffer(buffer, spec);
+  }
+  BM168x::fix_shape(input_spec->at(0), {p.M, p.K});
+  if (p.right_transpose == false) {
+    BM168x::fix_shape(input_spec->at(1), {p.K, p.N});
+  } else {
+    BM168x::fix_shape(input_spec->at(1), {p.N, p.K});
+  }
+  BM168x::fix_shape(output_spec->at(0), {p.M, p.N});
+  fc_global_spec_t spec;
+  memset(&spec, 0, sizeof(spec));
+  spec.if_relu = p.do_relu;
+  spec.relu_limit = p.relu_limit;
+  spec.have_bias = p.with_bias;
+  spec.requant_mode = -1;
+  spec.R_transpose = p.right_transpose;
+  if (module::isUniformQuantized(getInput())) {
+    spec.rshift = 0;
+    spec.is_asymmetric = 1;
+    spec.rzp_is_const = 1;
+    spec.rzp_const_val = p.right_zp;
+    spec.izp_const_val = p.input_zp;
+    if (module::isUniformQuantized(getOutput())) {
+      auto rshift_v = module::getI64Array(getRshifts(), 1, 0);
+      auto multiplier_v = module::getI64Array(getMultipliers(), 1, 1);
+      assert(rshift_v->size() == 1);
+      assert(multiplier_v->size() == 1);
+      spec.requant_mode = static_cast<int>(getQuantMode());
+      spec.mul_val = multiplier_v->at(0);
+      spec.shift_val = -rshift_v->at(0);
+      auto output_type = module::getUniformQuantizedType(getOutput());
+      spec.offset_val = output_type.getZeroPoint();
+      spec.round_mode = ROUNDING_HALF_AWAY_FROM_ZERO;
+    }
+  }
+  return BM168x::dynamic_spec_to_buffer(buffer, spec);
+}
+
+int64_t tpu::MatMulOp::get_fw_type_bm1684x() {
+  auto p = parseParam();
+  return (p.batch != 1 ? FW_BMNET_BATCH_MATMUL : FW_BMNET_FC);
+}

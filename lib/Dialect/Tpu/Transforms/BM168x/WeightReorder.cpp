@@ -7,7 +7,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "tpu_mlir/Dialect/Tpu/Transforms/BM1684/WeightReorder.h"
 #include "tpu_mlir/Dialect/Tpu/Transforms/BM168x/WeightReorder.h"
 #include "tpu_mlir/Dialect/Tpu/IR/TpuOps.h"
 #include "tpu_mlir/Dialect/Tpu/Transforms/GmemAllocator.hpp"
@@ -40,7 +39,9 @@ void populateWeightReorderPatterns(RewritePatternSet *patterns) {
     WeightReorder<tpu::DeconvOp, Float32Type>,
     WeightReorder<tpu::GRUOp, Float32Type>,
     WeightReorder<tpu::LSTMOp, Float32Type>,
-    WeightReorder<tpu::MatMulOp, int8_t>
+    WeightReorder<tpu::MatMulOp, int8_t>,
+    WeightReorder<tpu::MatMulOp, BFloat16Type>,
+    WeightReorder<tpu::MatMulOp, Float16Type>
   >(patterns->getContext());
   // clang-format on
 };

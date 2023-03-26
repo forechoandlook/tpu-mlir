@@ -114,11 +114,11 @@ T RightShiftRound(T src, int shift_num, RoundingMode round_mode);
 // to compilable with tflite
 int32_t MultiplyByQuantizedMultiplier(
     int32_t x, int32_t multiplier, int shift,
-    RoundingMode rmode=ROUNDING_HALF_AWAY_FROM_ZERO);
+    RoundingMode rmode = ROUNDING_HALF_AWAY_FROM_ZERO);
 int64_t applyMultiplierAndRShift(
     int64_t v, int64_t multiplier, int64_t rshift,
     tpu::RequantMode qmode = tpu::RequantMode::MultiplierShift,
-    RoundingMode rmode=ROUNDING_HALF_UP);
+    RoundingMode rmode = ROUNDING_HALF_UP);
 
 void pad_tensor(float *p_after_pad, float *src, int n, int c, int h, int w,
                 int pt, int pb, int pl, int pr, float pad_value);
@@ -129,9 +129,14 @@ void pad_tensor_for_deconv(float *p_after_pad, float *src, int n, int c, int d,
                            int h, int w, int kd, int kh, int kw, int dd, int dh,
                            int dw, int sd, int sh, int sw, int pdf, int pdb,
                            int pht, int phb, int pwl, int pwr, float pad_value);
+void dilate_tensor(float *p_after_pad, float *src, int n, int c, int d, int h,
+                   int w, int pdf, int pdb, int pht, int phb, int pwl, int pwr,
+                   float pad_value, int ins_h, int ins_w, float ins_value);
 void tensor_sub_zp(float *tensor_after_zp, float *src, int64_t length,
                    float zero_point);
 void tensor_hw_transpose(float *dst, float *src, int64_t N, int64_t C,
+                         int64_t H, int64_t W);
+void tensor_hc_transpose(float *dst, float *src, int64_t N, int64_t C,
                          int64_t H, int64_t W);
 void tensor_split(float *src_data, std::vector<std::vector<float>> &dst_data,
                   std::vector<int64_t> &shape, int slice_num, int axis);
@@ -162,7 +167,8 @@ int StopForAxis(const int *stop_indices, const int *strides, const int mask,
                 const int shrink_mask, const int *shape, const int axis,
                 int start_for_axis);
 std::vector<int64_t> shape_expand_dim(llvm::ArrayRef<int64_t> shape, int dims);
-std::vector<int64_t> channel_expand_dim(llvm::ArrayRef<int64_t> shape, int dims);
+std::vector<int64_t> channel_expand_dim(llvm::ArrayRef<int64_t> shape,
+                                        int dims);
 
 // reset pad to 4 dim
 bool pad_reset(const std::vector<int64_t> &shape,
@@ -272,5 +278,36 @@ uint8_t to_uint4(T value,
 
 void swap_dim_data(float *input, float *output, std::vector<int64_t> &ishape,
                    std::vector<int64_t> &offsets);
+
+inline void idx_to_list(int64_t idx, const std::vector<int64_t>& dim, std::vector<int64_t>& idx_res) {
+  int l = dim.size();
+  idx_res.resize(l, 0);
+  for (int i=l-1; i>=0; --i) {
+    idx_res[i] = idx % dim[i];
+    idx /= dim[i];
+  }
+}
+
+// convert shape to index for gaven stride
+inline int64_t list_to_idx(const std::vector<int64_t>& list,
+                           const std::vector<int64_t>& stride) {
+  return std::inner_product(list.begin(), list.end(), stride.begin(), 0);
+}
+
+// get the stride for the gaven shape
+inline void get_stride(const std::vector<int64_t>& shape, std::vector<int64_t>& stride) {
+  stride.clear();
+  stride.resize(shape.size(), 1);
+  for (int i = shape.size() - 2; i >= 0; --i) {
+    stride[i] = stride[i + 1] * shape[i + 1];
+  }
+  // set stride to 0 if shape need broadcast
+  for (int i = 0; i < shape.size(); ++i) {
+    stride[i] = shape[i] != 1 ? stride[i] : 0;
+  }
+}
+
+int getBcastIndex(int out_index, std::vector<int64_t> &output_shape,
+                  std::vector<int64_t> &input_shape);
 
 } // namespace tpu_mlir

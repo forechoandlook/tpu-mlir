@@ -21,31 +21,11 @@ def _os_system(cmd: list):
 
 
 def mlir_opt_for_top(mlirfile, opt_mlirfile, post_handle_type=""):
+    cmd = ["tpuc-opt", "--init", "--shape-infer", "--canonicalize"]
     if len(post_handle_type) > 0:
-        cmd = [
-            "tpuc-opt",
-            "--init",
-            "--canonicalize",
-            f"--post-handle=\"type={post_handle_type}\"",
-            "--mark-FLOPs",
-            "--save-weight",
-            "--mlir-print-debuginfo",
-            mlirfile,
-            "-o",
-            opt_mlirfile,
-        ]
-    else:
-        cmd = [
-            "tpuc-opt",
-            "--init",
-            "--canonicalize",
-            "--mark-FLOPs",
-            "--save-weight",
-            "--mlir-print-debuginfo",
-            mlirfile,
-            "-o",
-            opt_mlirfile,
-        ]
+        cmd.extend([f"--post-handle=\"type={post_handle_type}\""])
+    cmd.extend(
+        ["--after-optimize", "--save-weight", "--mlir-print-debuginfo", mlirfile, "-o", opt_mlirfile])
     _os_system(cmd)
 
 
@@ -73,6 +53,9 @@ def mlir_lowering(top_mlir: str,
         cali_param = "--import-calibration-table=\"file={} asymmetric={}\"".format(
             cali_table, asymmetric)
         cmd.extend([cali_param])
+    #do extra conversion for differnet chips
+    extra_conversion_param = "--do-extra-converison=\"chip={}\"".format(chip)
+    cmd.extend([extra_conversion_param])
     if fuse_preprocess:
         fuse_pre_param = "--fuse-preprocess=\"mode={} customization_format={}\"".format(
             mode, customization_format)
@@ -107,7 +90,8 @@ def mlir_to_model(tpu_mlir: str,
                   dynamic: bool = False,
                   quant_input: bool = False,
                   quant_output: bool = False,
-                  disable_layer_group: bool = False):
+                  disable_layer_group: bool = False,
+                  merge_weight: bool = False):
     # generate final mlir
     strip_io_quant_param = '--strip-io-quant="quant_input={} quant_output={}"'.format(
         quant_input, quant_output)
@@ -118,6 +102,10 @@ def mlir_to_model(tpu_mlir: str,
         else:
             lg_param = '--layer-group="opt=2"'
     subnet_param = '--subnet-divide="dynamic={}"'.format(dynamic)
+    address_assign_param = '--address-assign'
+    #address_assign_param = '--address-assign="reuse_addr=false"'
+    if merge_weight:
+        address_assign_param = '--address-assign="merge_weight=true weight_map_file=_weight_map.csv"'
     cmd = [
         "tpuc-opt",
         tpu_mlir,
@@ -128,8 +116,7 @@ def mlir_to_model(tpu_mlir: str,
         "--weight-reorder",
         subnet_param,
         lg_param,
-        "--address-assign",
-        #"--address-assign=\"reuse_addr=false\"",
+        address_assign_param,
         "--save-weight",
         "--mlir-print-debuginfo",
         "-o",
@@ -153,12 +140,17 @@ def mlir_to_model(tpu_mlir: str,
     _os_system(cmd)
 
     try:
-        _os_system(["mv compiler_profile_0.txt", model + ".compiler_profile_0.txt"])
+        _os_system(["mv compiler_profile_0.[td][xa]t", model + ".compiler_profile_0.txt"])
     except RuntimeError:
         pass
 
 
-def f32_blobs_compare(a_npz: str, b_npz: str, tolerance: str, excepts=None, show_detail=True, post_op=False):
+def f32_blobs_compare(a_npz: str,
+                      b_npz: str,
+                      tolerance: str,
+                      excepts=None,
+                      show_detail=True,
+                      post_op=False):
     cmd = ["npz_tool.py", "compare", a_npz, b_npz, "--tolerance", tolerance]
     if post_op:
         cmd.extend(["--post_op", post_op])
@@ -166,4 +158,19 @@ def f32_blobs_compare(a_npz: str, b_npz: str, tolerance: str, excepts=None, show
         cmd.extend(["--except", excepts])
     if show_detail:
         cmd.append('-vv')
+    _os_system(cmd)
+
+
+
+# TOPTOTOSA
+def top2tosa(top_mlir: str, tosa_mlir: str,):
+    cmd = ["tpuc-opt", top_mlir, "--init"]
+    lower_param = "--convert-top-to-tosa"
+    cmd.extend([
+        lower_param,
+        "--canonicalize",
+        "--mlir-print-debuginfo",
+        "-o",
+        tosa_mlir,
+    ])
     _os_system(cmd)

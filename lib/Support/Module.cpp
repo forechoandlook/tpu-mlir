@@ -12,6 +12,7 @@
 #include "tpu_mlir/Dialect/Top/IR/TopOps.h"
 #include "tpu_mlir/Dialect/Tpu/IR/TpuOps.h"
 #include "tpu_mlir/Support/MathUtils.h"
+#include "tpu_mlir/Interfaces/LocalGenInterface.h"
 
 #include "float.h"
 #include "mlir/Dialect/Quant/FakeQuantSupport.h"
@@ -35,17 +36,25 @@ struct Attr {
   static constexpr llvm::StringRef GMEM_PRIVATE_SIZE = "module.private_size";
   static constexpr llvm::StringRef ASYMMETRIC = "module.asymmetric";
   static constexpr llvm::StringRef MODE = "module.mode";
+  static constexpr llvm::StringRef PLATFORM = "module.platform";
 };
 
 static ModuleOp m = nullptr;
 static MLIRContext *ctx = nullptr;
 static Chip chip = Chip::ALL;
+static Platform platform = Platform::ONNX;
 
 void init(ModuleOp module) {
   m = module;
   ctx = m.getContext();
   auto chip_ = m->getAttrOfType<StringAttr>(Attr::CHIP);
   chip = symbolizeChip(chip_).value_or(Chip::ALL);
+  if (m->hasAttrOfType<StringAttr>(Attr::PLATFORM)) {
+    auto p = m->getAttrOfType<StringAttr>(Attr::PLATFORM);
+    platform = symbolizePlatform(p).value_or(Platform::ONNX);
+  } else {
+    platform = Platform::ONNX;
+  }
 }
 
 top::NoneOp getNoneOp(Operation *op) {
@@ -286,6 +295,60 @@ llvm::ArrayRef<int64_t> getShape(Value v) {
   return type.getShape();
 }
 
+void getGlobalShape(Value v, int *shape, int dim) {
+  for (auto v : llvm::enumerate(getShape(v)))
+    shape[v.index()] = (int)v.value();
+  for (int i = getShape(v).size(); i < dim; ++i)
+    shape[i] = 1;
+}
+
+void getLocalShape(Value v, int64_t n_step, int64_t h_step, int *shape) {
+  int64_t n, c, h, w;
+  module::getNCHW(v, n, c, h, w);
+  group_info_t gi = LocalGenInterface::getGroupInfo(v, n_step, h_step);
+  shape[0] = (int)gi.n_slice;
+  shape[1] = (int)c;
+  shape[2] = (int)gi.h_slice;
+  shape[3] = (int)w;
+}
+
+void get128BtyeAlignedStrideForNBit(int *stride, int *shape, int npu_num,
+                                    int bit) {
+  assert(bit == 8 || bit == 16 || bit == 32);
+  int aligned_bit;
+  switch (bit) {
+  case 8:
+    aligned_bit = 128;
+    break;
+  case 16:
+    aligned_bit = 64;
+    break;
+  case 32:
+    aligned_bit = 32;
+    break;
+  }
+  const int cstride = align_up(shape[3] * shape[2], aligned_bit);
+  stride[0] = (int)std::ceil((double)shape[1] / npu_num) * cstride;
+  stride[1] = cstride;
+  stride[2] = shape[3];
+  stride[3] = 1;
+}
+
+void getCompactStride(int *stride, int *shape, int npu_num) {
+  const int cstride = shape[2] * shape[3];
+  stride[0] = (int)std::ceil((double)shape[1] / npu_num) * cstride;
+  stride[1] = cstride;
+  stride[2] = shape[3];
+  stride[3] = 1;
+}
+
+void getContinousStride(int *stride, int *shape) {
+  stride[3] = 1;
+  stride[2] = shape[3];
+  stride[1] = shape[3] * shape[2];
+  stride[0] = stride[1] * shape[1];
+}
+
 i32_array_t getI32Array(ArrayAttr arrayAttr) {
   auto data = std::make_shared<std::vector<int32_t>>();
   for (auto en : llvm::enumerate(arrayAttr)) {
@@ -379,7 +442,10 @@ Type getStorageType(Value v) { return getStorageType(v.getType()); }
 Type getElementType(Value v) {
   auto type = v.getType();
   if (type.isa<RankedTensorType>()) {
-    auto rtype = v.getType().cast<RankedTensorType>();
+    auto rtype = type.cast<RankedTensorType>();
+    return rtype.getElementType();
+  } else if (type.isa<UnrankedTensorType>()) {
+    auto rtype = type.cast<UnrankedTensorType>();
     return rtype.getElementType();
   }
   return type;
@@ -479,7 +545,7 @@ void getNCHW(llvm::ArrayRef<int64_t> shape, int64_t &n, int64_t &c, int64_t &h,
     }
     module::getNCHW(shape_vec, n, c, h, w, false);
   } else {
-    llvm_unreachable("GROUP_3D is not implemented");
+    module::getNCHW(shape, n, c, h, w, true);
   }
 }
 
@@ -489,12 +555,37 @@ void getNCHW(Value v, int64_t &n, int64_t &c, int64_t &h, int64_t &w,
   getNCHW(shape, n, c, h, w, group_type);
 }
 
-bool isOpInGroup(Operation *Op) {
+void getNCDHW(Value v, int64_t &n, int64_t &c, int64_t &d, int64_t &h,
+              int64_t &w, group_type_t group_type) {
+  auto shape = v.getType().cast<RankedTensorType>().getShape();
+  int num_dims = shape.size();
+  if (GROUP_3D == group_type && isBM1684XFamily()) {
+    n = num_dims > 0 ? shape[0] : 1;
+    c = num_dims > 1 ? shape[1] : 1;
+    d = num_dims > 2 ? shape[2] : 1;
+    h = num_dims > 3 ? shape[3] : 1;
+    w = 1;
+    for (size_t i = 4; i < num_dims; ++i) {
+      w *= shape[i];
+    }
+    return;
+  } else {
+    d = 1;
+    getNCHW(shape, n, c, h, w, group_type);
+  }
+}
+
+bool isOpInGroup(Operation *Op, int64_t *group_type) {
   if (Op == nullptr) {
     return false;
   }
   auto parent = Op->getParentOp();
   if (parent != nullptr && isa<tpu::GroupOp>(parent)) {
+    if (group_type) {
+      if (auto groupop = dyn_cast<tpu::GroupOp>(Op)) {
+        *group_type = groupop.getGroupType();
+      }
+    }
     return true;
   }
   return false;
@@ -543,7 +634,39 @@ bool isWeight(Value v) {
   return false;
 }
 
+bool isAllWeight(Operation *op) {
+  for (auto in : op->getOperands()) {
+    if (isNone(in) || isWeight(in)) {
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
 bool isNone(Value v) { return v.getType().isa<mlir::NoneType>(); }
+
+bool isUnranked(Value v) { return v.getType().isa<mlir::UnrankedTensorType>(); }
+
+void setShapeOrVerify(Value v, llvm::ArrayRef<int64_t> shape) {
+  if (isUnranked(v)) {
+    auto newType = RankedTensorType::get(shape, getElementType(v));
+    v.setType(newType);
+  } else {
+    auto s = getShape(v);
+    if (s != shape) {
+      v.dump();
+      llvm_unreachable("Shape Verify failed");
+    }
+  }
+}
+
+bool isGlobalBuffer(Value v) {
+  const auto op = v.getDefiningOp();
+  if (!op)
+    return false;
+  return isa<tpu::BufferOp>(op);
+}
 
 llvm::StringRef getModuleName() {
   return m->getAttrOfType<StringAttr>(Attr::NAME).getValue();
@@ -631,6 +754,10 @@ State getState() {
   return symbolizeState(s).value_or(State::TOP_F32);
 }
 
+Platform getPlatform() { return platform; }
+
+bool isPlatform(Platform plt) { return platform == plt; }
+
 void setState(State state) {
   auto s = stringifyState(state);
   m->setAttr(Attr::STATE, StringAttr::get(ctx, s));
@@ -651,6 +778,7 @@ bool isBM1684XFamily() {
   return (chip == Chip::BM1684X || chip == Chip::BM1686);
 }
 bool isBM1686() { return (chip == Chip::BM1686); }
+bool isBM1684X() { return (chip == Chip::BM1684X); }
 
 ModuleOp getModuleOp() { return m; }
 
@@ -665,19 +793,57 @@ double getThreshold(Value v) {
   return type.getMax();
 }
 
+uint32_t getIdx(Value v) {
+  uint32_t idx = 0;
+  if (auto r = v.dyn_cast<OpResult>()) {
+    idx = r.getResultNumber();
+  } else if (auto r = v.dyn_cast<BlockArgument>()) {
+    idx = r.getArgNumber();
+  } else {
+    v.dump();
+    llvm_unreachable("Not Implemented");
+  }
+  return idx;
+}
+
+void setLoc(Value v, NameLoc loc) {
+  if (v.getLoc().isa<NameLoc>()) {
+    v.setLoc(loc);
+    return;
+  }
+  if (auto fuse_loc = v.getLoc().dyn_cast<FusedLoc>()) {
+    std::vector<mlir::Location> locs = fuse_loc.getLocations();
+    uint32_t idx = getIdx(v);
+    locs[idx] = loc;
+    auto new_loc = FusedLoc::get(v.getContext(), locs);
+    v.setLoc(new_loc);
+    return;
+  }
+  if (auto op = v.getDefiningOp()) {
+    auto op_loc = op->getLoc();
+    if (op_loc.isa<NameLoc>()) {
+      op->setLoc(loc);
+      return;
+    }
+    if (auto fuse_loc = op->getLoc().dyn_cast<FusedLoc>()) {
+      std::vector<mlir::Location> locs = fuse_loc.getLocations();
+      auto idx = getIdx(v);
+      locs[idx] = loc;
+      auto new_loc = FusedLoc::get(v.getContext(), locs);
+      op->setLoc(new_loc);
+      return;
+    }
+  }
+  v.dump();
+  llvm_unreachable("Not Implemented");
+}
+
 NameLoc getLoc(Value v) {
   if (auto loc = v.getLoc().dyn_cast<NameLoc>()) {
     return loc;
   } else if (auto fuse_loc = v.getLoc().dyn_cast<FusedLoc>()) {
     auto locs = fuse_loc.getLocations();
-    uint32_t idx = 0;
-    if (auto r = v.dyn_cast<OpResult>()) {
-      idx = r.getResultNumber();
-    } else if (auto r = v.dyn_cast<BlockArgument>()) {
-      idx = r.getArgNumber();
-    } else {
-      llvm_unreachable("Not Implemented");
-    }
+    uint32_t idx = getIdx(v);
     if (auto name_loc = locs[idx].dyn_cast<NameLoc>()) {
       return name_loc;
     }
@@ -687,9 +853,9 @@ NameLoc getLoc(Value v) {
       return name_loc;
     }
     if (auto fuse_loc = loc.dyn_cast<FusedLoc>()) {
-      auto r = v.cast<OpResult>();
+      uint32_t idx = getIdx(v);
       auto locs = fuse_loc.getLocations();
-      if (auto name_loc = locs[r.getResultNumber()].dyn_cast<NameLoc>()) {
+      if (auto name_loc = locs[idx].dyn_cast<NameLoc>()) {
         return name_loc;
       }
     }

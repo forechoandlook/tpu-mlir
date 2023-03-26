@@ -12,12 +12,10 @@
 #include "tpu_mlir/Support/Module.h"
 #include "tpu_mlir/Support/MathUtils.h"
 
-
-
 int64_t top::AvgPoolOp::getFLOPs() {
   auto attr = parseParam();
   return module::getNumElements(getOutput()) *
-         (attr.kd * attr.kh * attr.kw + attr.do_relu ? 1 : 0);
+         (attr.kd * attr.kh * attr.kw + (attr.do_relu ? 1 : 0));
 }
 
 pool_attr_t top::AvgPoolOp::parseParam() {
@@ -111,8 +109,40 @@ LogicalResult top::AvgPoolOp::inference(InferenceParameter &p) {
   pooling->run();
   if (getDoRelu()) {
     auto limit = getReluLimit().convertToDouble();
-    function_relu(p.outputs[0], p.outputs[0], module::getNumElements(getOutput()),
-                  limit);
+    function_relu(p.outputs[0], p.outputs[0],
+                  module::getNumElements(getOutput()), limit);
   }
   return success();
+}
+
+void top::AvgPoolOp::shape_inference() {
+  auto input_shape = module::getShape(getInput());
+  auto kernel_shape = module::getI64Array(getKernelShape());
+  assert(input_shape.size() > 2);
+  int spacial_rank = input_shape.size() - 2;
+  assert(spacial_rank == getKernelShape().size());
+  assert(getPads().size() == spacial_rank * 2);
+  llvm::SmallVector<int64_t> out_shape;
+  out_shape.push_back(input_shape[0]);
+  out_shape.push_back(input_shape[1]);
+  auto input_spacial_shape = llvm::ArrayRef(&input_shape[2], spacial_rank);
+  auto pads = module::getI64Array(getPads());
+  auto strides = module::getI64Array(getStrides());
+  for (int i = 0; i < spacial_rank; i++) {
+    auto out_dim = (input_spacial_shape[i] + pads->at(i) +
+                    pads->at(i + spacial_rank) - kernel_shape->at(i)) /
+                       strides->at(i) +
+                   1;
+    out_shape.push_back(out_dim);
+  }
+  if (getKeepdims() == false) {
+    while (out_shape.size() > 2) {
+      if (out_shape.back() == 1) {
+        out_shape.pop_back();
+      } else {
+        break;
+      }
+    }
+  }
+  module::setShapeOrVerify(getOutput(), out_shape);
 }

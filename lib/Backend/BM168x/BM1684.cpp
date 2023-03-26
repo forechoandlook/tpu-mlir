@@ -28,6 +28,7 @@ void BM1684::load_functions() {
   CAST_FUNCTION_WITH_SYM(cmd_id_divide, __cmd_id_divide);
   CAST_FUNCTION_WITH_SYM(cmd_id_merge, __cmd_id_merge);
   CAST_FUNCTION_WITH_SYM(sg_set_profile_dump, bm_set_profile_dump);
+  CAST_FUNCTION_WITH_SYM(sg_set_profile_path, bm_set_profile_path);
   CAST_FUNCTION_WITH_SYM(sg_stas_dump, bm_stas_dump);
   CAST_FUNCTION_WITH_SYM(sg_flops_dump, bm_flops_dump);
   CAST_FUNCTION_WITH_SYM(sg_stas_reset, bm_stas_reset);
@@ -53,6 +54,11 @@ void BM1684::load_functions() {
   CAST_FUNCTION(nodechip_bnscale_fix8b_forward_local);
   CAST_FUNCTION(nodechip_scale_forward_local);
   CAST_FUNCTION(nodechip_eltwise_forward_local);
+  CAST_FUNCTION(nodechip_broadcast_binary_fix8b_forward_parallel);
+  CAST_FUNCTION(nodechip_broadcast_binary);
+  CAST_FUNCTION(nodechip_broadcast_binary_local);
+  CAST_FUNCTION(nodechip_broadcast_binary_fix8b_forward_local);
+  CAST_FUNCTION(nodechip_broadcast_binary_full);
   CAST_FUNCTION(nodechip_eltwise_fix8b_forward_local);
   CAST_FUNCTION(nodechip_fc_forward_local);
   CAST_FUNCTION(nodechip_prelu_forward_local_v2);
@@ -188,5 +194,9 @@ void BM1684::load_functions() {
   CAST_FUNCTION(nodechip_global_int2float);
   CAST_FUNCTION(nodechip_float2int8_v2);
   CAST_FUNCTION(nodechip_const_binary_local);
+  CAST_FUNCTION(nodechip_transpose);
+  CAST_FUNCTION(nodechip_transpose_fix8b);
+  CAST_FUNCTION(nodechip_float2int8_local_keep_input);
+  CAST_FUNCTION(tensor_int8_to_float_local_v2);
   // clang-format on
 }

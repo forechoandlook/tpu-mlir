@@ -27,11 +27,9 @@ static void sigmoid_batch(float *x, const int n) {
   }
 }
 
-static float softplus_activate(float x) {
-  return std::log(std::exp(x) + 1);
-}
+static float softplus_activate(float x) { return std::log(std::exp(x) + 1); }
 
-static inline float tanh_activate (float x) {
+static inline float tanh_activate(float x) {
   return (2 / (1 + std::exp(-2 * x)) - 1);
 }
 
@@ -194,6 +192,84 @@ static void DecodeBBoxesAll_opt(const std::vector<LabelBBox_l> &all_loc_preds,
         decode_bbox.ymin = decode_bbox_center_y - decode_bbox_height * 0.5;
         decode_bbox.xmax = decode_bbox_center_x + decode_bbox_width * 0.5;
         decode_bbox.ymax = decode_bbox_center_y + decode_bbox_height * 0.5;
+        decode_bbox.CalcSize();
+        p->push_back(decode_bbox);
+      }
+    }
+  }
+}
+
+static void GetConfidenceScores_v2_opt(
+    const float *conf_data, const int num, const int num_preds_per_class,
+    const int num_classes, const float score_threshold,
+    std::vector<std::map<int, std::vector<std::pair<float, int>>>>
+        *conf_preds) {
+  conf_preds->clear();
+  conf_preds->resize(num);
+  for (int i = 0; i < num; ++i) {
+    std::map<int, std::vector<std::pair<float, int>>> &label_scores =
+        (*conf_preds)[i];
+    for (int p = 0; p < num_classes; ++p) {
+      int start_idx = p * num_preds_per_class;
+      for (int c = 0; c < num_preds_per_class; ++c) {
+        if (conf_data[start_idx + c] > score_threshold) {
+          label_scores[p].push_back(
+              std::make_pair(conf_data[start_idx + c], c));
+        }
+      }
+    }
+    conf_data += num_preds_per_class * num_classes;
+  }
+}
+
+static void
+DecodeBBoxesAll_v2_opt(const std::vector<LabelBBox_l> &all_loc_preds,
+                       int num_priors, const float *prior_data, const int num,
+                       const bool share_location, const int num_loc_classes,
+                       const int background_label_id, const CodeType code_type,
+                       const bool variance_encoded_in_target, const bool clip,
+                       float *decode_index,
+                       std::vector<LabelBBox_l> *all_decode_bboxes) {
+  assert(all_loc_preds.size() == (size_t)num);
+  all_decode_bboxes->clear();
+  all_decode_bboxes->resize(num);
+  float *decode_pos = decode_index;
+  for (int i = 0; i < num; ++i) {
+    if (share_location) {
+      decode_pos = decode_index + i * num_priors;
+    }
+    // Decode predictions into bboxes.
+    for (int c = 0; c < num_loc_classes; ++c) {
+      int label = share_location ? -1 : c;
+      if (label == background_label_id) {
+        // Ignore background class.
+        continue;
+      }
+      if (all_loc_preds[i].find(label) == all_loc_preds[i].end()) {
+        llvm::errs() << "Could not find location predictions for label "
+                     << label;
+      }
+      const std::vector<BBox_l> &bboxes = all_loc_preds[i].find(label)->second;
+      LabelBBox_l &decode_bboxes = (*all_decode_bboxes)[i];
+      std::vector<BBox_l> *p = &(decode_bboxes[label]);
+      p->clear();
+
+      if (!share_location) {
+        decode_pos =
+            decode_index + num_priors * num_loc_classes * i + num_priors * c;
+      }
+      for (int k = 0; k < num_priors; ++k) {
+        // NormalizedBBox decode_bbox;
+        BBox_l decode_bbox;
+        if (decode_pos[k] != 1) {
+          p->push_back(decode_bbox);
+          continue;
+        }
+
+        decode_bbox.xmin = bboxes[k].xmin;
+        decode_bbox.ymin = bboxes[k].ymin;
+        decode_bbox.xmax = bboxes[k].xmax;
+        decode_bbox.ymax = bboxes[k].ymax;
         decode_bbox.CalcSize();
         p->push_back(decode_bbox);
       }
@@ -457,14 +533,22 @@ DetectionOutputFunc::DetectionOutputFunc(DetParam &param) : param_(param) {}
 
 void DetectionOutputFunc::invoke() {
   int num = param_.loc_shape[0];
-  int num_priors = param_.prior_shape[2] / 4;
+  int num_priors =
+      param_.onnx_nms ? param_.loc_shape[1] : param_.prior_shape[2] / 4;
   int num_loc_classes = param_.share_location ? 1 : param_.num_classes;
   float eta = 1.0;
   bool variance_encoded_in_target = false;
   std::vector<std::map<int, std::vector<std::pair<float, int>>>>
       all_conf_scores;
-  GetConfidenceScores_opt(param_.conf_data, num, num_priors, param_.num_classes,
-                          param_.confidence_threshold, &all_conf_scores);
+  if (!param_.onnx_nms) {
+    GetConfidenceScores_opt(param_.conf_data, num, num_priors,
+                            param_.num_classes, param_.confidence_threshold,
+                            &all_conf_scores);
+  } else {
+    GetConfidenceScores_v2_opt(param_.conf_data, num, num_priors,
+                               param_.num_classes, param_.confidence_threshold,
+                               &all_conf_scores);
+  }
   for (int i = 0; i < num; ++i) {
     for (int c = 0; c < param_.num_classes; ++c) {
       if (all_conf_scores[i].find(c) == all_conf_scores[i].end()) {
@@ -474,8 +558,8 @@ void DetectionOutputFunc::invoke() {
           all_conf_scores[i].find(c)->second;
 
       if (param_.top_k < (int)scores.size()) {
-        std::partial_sort(scores.begin(), scores.begin() + param_.top_k, scores.end(),
-                          SortScoreCmp0);
+        std::partial_sort(scores.begin(), scores.begin() + param_.top_k,
+                          scores.end(), SortScoreCmp0);
       } else {
         std::sort(scores.begin(), scores.end(), SortScoreCmp0);
       }
@@ -499,7 +583,8 @@ void DetectionOutputFunc::invoke() {
     }
     for (int c = 0; c < param_.num_classes; ++c) {
       if (!param_.share_location) {
-        ptr = decode_keep_index + num_priors * param_.num_classes * i + num_priors * c;
+        ptr = decode_keep_index + num_priors * param_.num_classes * i +
+              num_priors * c;
       }
       if (c == param_.background_label_id) {
         // Ignore background class.
@@ -510,7 +595,8 @@ void DetectionOutputFunc::invoke() {
         continue;
       std::vector<std::pair<float, int>> &scores =
           all_conf_scores[i].find(c)->second;
-      int length = param_.top_k < (int)scores.size() ? param_.top_k : scores.size();
+      int length =
+          param_.top_k < (int)scores.size() ? param_.top_k : scores.size();
       for (int k = 0; k < length; ++k) {
         ptr[scores[k].second] = 1;
       }
@@ -520,15 +606,25 @@ void DetectionOutputFunc::invoke() {
   // Retrieve all location predictions.
   std::vector<LabelBBox_l> all_loc_preds;
   GetLocPredictions_opt(param_.loc_data, num, num_priors, num_loc_classes,
-                        param_.share_location, decode_keep_index, &all_loc_preds);
+                        param_.share_location, decode_keep_index,
+                        &all_loc_preds);
 
   // Decode all loc predictions to bboxes.
   std::vector<LabelBBox_l> all_decode_bboxes;
   const bool clip_bbox = false;
-  DecodeBBoxesAll_opt(all_loc_preds, num_priors, param_.prior_data, num,
-                      param_.share_location, num_loc_classes, param_.background_label_id,
-                      param_.code_type, variance_encoded_in_target, clip_bbox,
-                      decode_keep_index, &all_decode_bboxes);
+  if (!param_.onnx_nms) {
+    DecodeBBoxesAll_opt(all_loc_preds, num_priors, param_.prior_data, num,
+                        param_.share_location, num_loc_classes,
+                        param_.background_label_id, param_.code_type,
+                        variance_encoded_in_target, clip_bbox,
+                        decode_keep_index, &all_decode_bboxes);
+  } else {
+    DecodeBBoxesAll_v2_opt(all_loc_preds, num_priors, param_.prior_data, num,
+                           param_.share_location, num_loc_classes,
+                           param_.background_label_id, param_.code_type,
+                           variance_encoded_in_target, clip_bbox,
+                           decode_keep_index, &all_decode_bboxes);
+  }
   delete[] decode_keep_index;
 
   int num_kept = 0;
@@ -557,8 +653,8 @@ void DetectionOutputFunc::invoke() {
       const std::vector<BBox_l> &bboxes = decode_bboxes.find(label)->second;
       const std::vector<std::pair<float, int>> &aa =
           conf_scores.find(c)->second;
-      ApplyNMSFast_opt(bboxes, aa, param_.confidence_threshold, param_.nms_threshold, eta,
-                       param_.top_k, &(indices[c]));
+      ApplyNMSFast_opt(bboxes, aa, param_.confidence_threshold,
+                       param_.nms_threshold, eta, param_.top_k, &(indices[c]));
 
       num_det += indices[c].size();
     }
@@ -597,7 +693,6 @@ void DetectionOutputFunc::invoke() {
     }
   }
   float *top_data = (float *)param_.output_data;
-
   int output_size = num * param_.keep_top_k * 1 * 1 * 7;
   // init output buf
   for (int i = 0; i < output_size; ++i) {
@@ -892,7 +987,8 @@ static void anchor_box_nms(std::vector<std::vector<float>> &pred_boxes,
 }
 
 ProposalFunc::ProposalFunc(ProposalParam &param) : param_(param) {
-  generate_anchors(param_.anchor_base_size, anchor_scale, anchor_ratio, anchor_boxes);
+  generate_anchors(param_.anchor_base_size, anchor_scale, anchor_ratio,
+                   anchor_boxes);
 }
 
 void ProposalFunc::invoke() {
@@ -978,16 +1074,14 @@ void ProposalFunc::invoke() {
   }
 }
 
-ROIPoolingFunc::ROIPoolingFunc(ROIPoolingParam &param) : param_(param) {
-
-}
+ROIPoolingFunc::ROIPoolingFunc(ROIPoolingParam &param) : param_(param) {}
 
 void ROIPoolingFunc::invoke() {
   assert(param_.inputs.size() == 2);
   float *input_data = param_.inputs[0].ptr;
   float *rois = param_.inputs[1].ptr;
   float *output_data = param_.output.ptr;
-  auto input_shape =  param_.inputs[0].shape;
+  auto input_shape = param_.inputs[0].shape;
   auto roi_shape = param_.inputs[1].shape;
   int64_t pooled_h = param_.pooled_h;
   int64_t pooled_w = param_.pooled_w;
@@ -1018,8 +1112,7 @@ void ROIPoolingFunc::invoke() {
       const float bin_size_w =
           static_cast<float>(roi_width) / static_cast<float>(pooled_w);
 
-      float *batch_data =
-          input_data + roi_batch_ind * channel * height * width;
+      float *batch_data = input_data + roi_batch_ind * channel * height * width;
 
       for (int c = 0; c < channel; ++c) {
         for (int ph = 0; ph < pooled_h; ++ph) {
@@ -1070,6 +1163,7 @@ class Reducer {
   roi_align_mode_t mode;
   int count;
   float result;
+
 public:
   Reducer(roi_align_mode_t _mode) : mode(_mode) {}
   void init() {
@@ -1097,9 +1191,7 @@ public:
   }
 };
 
-RoiAlignFunc::RoiAlignFunc(RoiAlignParam &param) : param_(param) {
-
-}
+RoiAlignFunc::RoiAlignFunc(RoiAlignParam &param) : param_(param) {}
 
 struct RoiAlignPreCalc {
   int pos[4];
@@ -1204,9 +1296,9 @@ void RoiAlignFunc::invoke() {
     int sample_h = sampling_ratio > 0.0f ? sampling_ratio : ceil(bin_h);
     const int sample_size = sample_h * sample_w;
     std::vector<RoiAlignPreCalc> pre_calc(sample_size * pooled_size);
-    preCalcForBilinearInterp(
-        IH, IW, OH, OW, sample_h, sample_w, start_h, start_w,
-        roi_h * pooled_h_inv, roi_w * pooled_w_inv, sampling_ratio, pre_calc);
+    preCalcForBilinearInterp(IH, IW, OH, OW, sample_h, sample_w, start_h,
+                             start_w, roi_h * pooled_h_inv,
+                             roi_w * pooled_w_inv, sampling_ratio, pre_calc);
     Reducer reducer(mode);
     int index_n = i * IC * pooled_size;
     for (int c = 0; c < IC; ++c) {
@@ -1300,9 +1392,7 @@ static void nms(detections *dets, int num, float nms_threshold) {
   }
 }
 
-FrcnDetctionFunc::FrcnDetctionFunc(FrcnDetParam &param) : param_(param) {
-
-}
+FrcnDetctionFunc::FrcnDetctionFunc(FrcnDetParam &param) : param_(param) {}
 
 void FrcnDetctionFunc::invoke() {
   assert(param_.inputs.size() == 3);
@@ -1389,18 +1479,19 @@ void FrcnDetctionFunc::invoke() {
 }
 
 void RetinaFaceDetectionFunc::setup(std::vector<tensor_list_t> &inputs,
-            tensor_list_t &output, RetinaFaceDetectionParam &param) {
+                                    tensor_list_t &output,
+                                    RetinaFaceDetectionParam &param) {
   // sort inputs by neuron shape size
   std::sort(inputs.begin(), inputs.end(),
-   [](const tensor_list_t &a, const tensor_list_t &b) {
-    if (a.shape[3] < b.shape[3]) {
-      return true;
-    } else if (a.shape[3] == b.shape[3]) {
-      return a.shape[1] < b.shape[1];
-    } else {
-      return false;
-    }
-  });
+            [](const tensor_list_t &a, const tensor_list_t &b) {
+              if (a.shape[3] < b.shape[3]) {
+                return true;
+              } else if (a.shape[3] == b.shape[3]) {
+                return a.shape[1] < b.shape[1];
+              } else {
+                return false;
+              }
+            });
   _bottoms = inputs;
   _tops = output;
   _nms_threshold = param.nms_threshold;
@@ -1422,35 +1513,48 @@ void RetinaFaceDetectionFunc::invoke() {
     for (size_t i = 0; i < _feature_stride_fpn.size(); ++i) {
       int stride = _feature_stride_fpn[i];
 
-      size_t offset0 = b * _bottoms[3*i].shape[1] * _bottoms[3*i].shape[2] * _bottoms[3*i].shape[3];
-      size_t count0 = _bottoms[3*i].shape[0] * _bottoms[3*i].shape[1] * _bottoms[3*i].shape[2] * _bottoms[3*i].shape[3];
-      auto score_data = _bottoms[3*i].ptr + offset0;
+      size_t offset0 = b * _bottoms[3 * i].shape[1] * _bottoms[3 * i].shape[2] *
+                       _bottoms[3 * i].shape[3];
+      size_t count0 = _bottoms[3 * i].shape[0] * _bottoms[3 * i].shape[1] *
+                      _bottoms[3 * i].shape[2] * _bottoms[3 * i].shape[3];
+      auto score_data = _bottoms[3 * i].ptr + offset0;
       size_t score_count = count0 / batch;
 
-      size_t offset1 = b * _bottoms[3*i+1].shape[1] * _bottoms[3*i+1].shape[2] * _bottoms[3*i+1].shape[3];
-      size_t count1 = _bottoms[3*i+1].shape[0] * _bottoms[3*i+1].shape[1] * _bottoms[3*i+1].shape[2] * _bottoms[3*i+1].shape[3];
-      auto bbox_data = _bottoms[3*i+1].ptr + offset1;
+      size_t offset1 = b * _bottoms[3 * i + 1].shape[1] *
+                       _bottoms[3 * i + 1].shape[2] *
+                       _bottoms[3 * i + 1].shape[3];
+      size_t count1 =
+          _bottoms[3 * i + 1].shape[0] * _bottoms[3 * i + 1].shape[1] *
+          _bottoms[3 * i + 1].shape[2] * _bottoms[3 * i + 1].shape[3];
+      auto bbox_data = _bottoms[3 * i + 1].ptr + offset1;
       size_t bbox_count = count1 / batch;
 
-      size_t offset2 = b * _bottoms[3*i+2].shape[1] * _bottoms[3*i+2].shape[2] * _bottoms[3*i+2].shape[3];
-      size_t count2 = _bottoms[3*i+2].shape[0] * _bottoms[3*i+2].shape[1] * _bottoms[3*i+2].shape[2] * _bottoms[3*i+2].shape[3];
-      auto landmark_data = _bottoms[3*i+2].ptr + offset2;
+      size_t offset2 = b * _bottoms[3 * i + 2].shape[1] *
+                       _bottoms[3 * i + 2].shape[2] *
+                       _bottoms[3 * i + 2].shape[3];
+      size_t count2 =
+          _bottoms[3 * i + 2].shape[0] * _bottoms[3 * i + 2].shape[1] *
+          _bottoms[3 * i + 2].shape[2] * _bottoms[3 * i + 2].shape[3];
+      auto landmark_data = _bottoms[3 * i + 2].ptr + offset2;
       size_t landmark_count = count2 / batch;
 
-      auto shape = _bottoms[3*i].shape;
+      auto shape = _bottoms[3 * i].shape;
       size_t height = shape[2];
       size_t width = shape[3];
 
-      std::vector<float> score(score_data + score_count / 2, score_data + score_count);
+      std::vector<float> score(score_data + score_count / 2,
+                               score_data + score_count);
       std::vector<float> bbox(bbox_data, bbox_data + bbox_count);
-      std::vector<float> landmark(landmark_data, landmark_data + landmark_count);
+      std::vector<float> landmark(landmark_data,
+                                  landmark_data + landmark_count);
 
       int count = height * width;
       std::string key = "stride" + std::to_string(stride);
       auto anchors_fpn = _anchors_fpn[key];
       auto num_anchors = _num_anchors[key];
 
-      std::vector<AnchorBox> anchors = anchors_plane(height, width, stride, anchors_fpn);
+      std::vector<AnchorBox> anchors =
+          anchors_plane(height, width, stride, anchors_fpn);
 
       for (int num = 0; num < num_anchors; ++num) {
         for (int j = 0; j < count; ++j) {
@@ -1468,7 +1572,8 @@ void RetinaFaceDetectionFunc::invoke() {
           std::vector<float> landmark_deltas(10, 0);
           for (size_t k = 0; k < 5; ++k) {
             landmark_deltas[k] = landmark[j + count * (num * 10 + k * 2)];
-            landmark_deltas[k + 5] = landmark[j + count * (num * 10 + k * 2 + 1)];
+            landmark_deltas[k + 5] =
+                landmark[j + count * (num * 10 + k * 2 + 1)];
           }
 
           auto pts = landmark_pred(anchors[j + count * num], landmark_deltas);
@@ -1512,7 +1617,8 @@ void RetinaFaceDetectionFunc::invoke() {
 }
 
 template <typename Dtype>
-void ApplyNms_opt(std::vector<PredictionResult>& boxes, std::vector<int>& idxes, Dtype threshold) {
+void ApplyNms_opt(std::vector<PredictionResult> &boxes, std::vector<int> &idxes,
+                  Dtype threshold) {
   int bbox_cnt = (int)boxes.size();
   // init the map
   uint32_t map[bbox_cnt / 32 + 1];
@@ -1552,7 +1658,8 @@ void ApplyNms_opt(std::vector<PredictionResult>& boxes, std::vector<int>& idxes,
   }
 }
 
-Yolo_v2_DetectionFunc::Yolo_v2_DetectionFunc(YoloDetParam &param) : param_(param) {
+Yolo_v2_DetectionFunc::Yolo_v2_DetectionFunc(YoloDetParam &param)
+    : param_(param) {
   std::istringstream iss(param_.anchors);
   std::string s;
   while (std::getline(iss, s, ',')) {
@@ -1601,7 +1708,7 @@ void Yolo_v2_DetectionFunc::invoke() {
   int mask_offset = 0;
   const int num = batch_num;
   int total_num = 0;
-  std::vector<PredictionResult > total_preds;
+  std::vector<PredictionResult> total_preds;
   total_preds.clear();
 
   // calc the threshold for Po
@@ -1615,13 +1722,12 @@ void Yolo_v2_DetectionFunc::invoke() {
       int h = (int)param_.inputs[index].shape[2];
       int w = (int)param_.inputs[index].shape[3];
       int stride = h * w;
-      const float* input_data = param_.inputs[index].ptr;
+      const float *input_data = param_.inputs[index].ptr;
       for (int cy = 0; cy < h; cy++) {
         for (int cx = 0; cx < w; cx++) {
           for (int n = 0; n < param_.num_boxes; n++) {
-            int index = b * param_.num_boxes * len * stride +
-                          n * len * stride +
-                          cy * w + cx;
+            int index = b * param_.num_boxes * len * stride + n * len * stride +
+                        cy * w + cx;
             std::vector<float> pred;
             class_score.clear();
 
@@ -1647,23 +1753,27 @@ void Yolo_v2_DetectionFunc::invoke() {
             }
 
             PredictionResult predict;
-            swap_data[1] = *std::max_element(class_score.begin(), class_score.end());
-            int arg_max = std::distance(class_score.begin(),
-              std::max_element(class_score.begin(), class_score.end()));
+            swap_data[1] =
+                *std::max_element(class_score.begin(), class_score.end());
+            int arg_max = std::distance(
+                class_score.begin(),
+                std::max_element(class_score.begin(), class_score.end()));
 
             sigmoid_batch(swap_data, 4);
             // Pmax = Pmax * Po
             swap_data[1] = swap_data[0] * swap_data[1];
 
             if (swap_data[1] > param_.obj_threshold) {
-              [&](std::vector<float> &b, float* x, float* biases, int n, int i, int j, int lw, int lh, int w, int h) {
-                  b.clear();
-                  b.push_back((i + (x[0])) / lw);
-                  b.push_back((j + (x[1])) / lh);
-                  b.push_back(exp(x[2]) * biases[2 * n] / (w));
-                  b.push_back(exp(x[3]) * biases[2 * n + 1] / (h));
-                }(pred, &swap_data[2], _anchors.data(), param_.mask[n + mask_offset],
-                    cx, cy, w, h, param_.net_input_w, param_.net_input_h);
+              [&](std::vector<float> &b, float *x, float *biases, int n, int i,
+                  int j, int lw, int lh, int w, int h) {
+                b.clear();
+                b.push_back((i + (x[0])) / lw);
+                b.push_back((j + (x[1])) / lh);
+                b.push_back(exp(x[2]) * biases[2 * n] / (w));
+                b.push_back(exp(x[3]) * biases[2 * n + 1] / (h));
+              }(pred, &swap_data[2], _anchors.data(),
+                param_.mask[n + mask_offset], cx, cy, w, h, param_.net_input_w,
+                param_.net_input_h);
 
               predict.idx = b;
               predict.x = pred[0];
@@ -1686,21 +1796,26 @@ void Yolo_v2_DetectionFunc::invoke() {
 
     int num_kept = 0;
     if (predicts.size() > 0) {
-      std::stable_sort(predicts.begin(), predicts.end(), [](const PredictionResult& box1, const PredictionResult& box2) {
-                                                            return box1.confidence > box2.confidence;});
-      //sprintf(str, "Sort Box (batch %d)", b);
+      std::stable_sort(
+          predicts.begin(), predicts.end(),
+          [](const PredictionResult &box1, const PredictionResult &box2) {
+            return box1.confidence > box2.confidence;
+          });
+      // sprintf(str, "Sort Box (batch %d)", b);
 
       ApplyNms_opt(predicts, idxes, param_.nms_threshold);
       num_kept = idxes.size();
-      //sprintf(str, "NMS %d Boxes (batch %d)", num_kept, b);
+      // sprintf(str, "NMS %d Boxes (batch %d)", num_kept, b);
 
       if (param_.keep_topk > 0) {
-        if (num_kept > param_.keep_topk)    num_kept = param_.keep_topk;
+        if (num_kept > param_.keep_topk)
+          num_kept = param_.keep_topk;
       } else {
-        if (num_kept > KEEP_TOP_K)    num_kept = KEEP_TOP_K;
+        if (num_kept > KEEP_TOP_K)
+          num_kept = KEEP_TOP_K;
       }
 
-      for (int i=0; i < num_kept; i++) {
+      for (int i = 0; i < num_kept; i++) {
         total_preds.push_back(predicts[idxes[i]]);
       }
       total_num += num_kept;
@@ -1718,14 +1833,554 @@ void Yolo_v2_DetectionFunc::invoke() {
     }
   } else {
     for (int i = 0; i < total_num; i++) {
-      top_data[i*7+0] = total_preds[i].idx;         // Image_Id
-      top_data[i*7+1] = total_preds[i].classType;   // label
-      top_data[i*7+2] = total_preds[i].confidence;  // confidence
-      top_data[i*7+3] = total_preds[i].x;
-      top_data[i*7+4] = total_preds[i].y;
-      top_data[i*7+5] = total_preds[i].w;
-      top_data[i*7+6] = total_preds[i].h;
+      top_data[i * 7 + 0] = total_preds[i].idx;        // Image_Id
+      top_data[i * 7 + 1] = total_preds[i].classType;  // label
+      top_data[i * 7 + 2] = total_preds[i].confidence; // confidence
+      top_data[i * 7 + 3] = total_preds[i].x;
+      top_data[i * 7 + 4] = total_preds[i].y;
+      top_data[i * 7 + 5] = total_preds[i].w;
+      top_data[i * 7 + 6] = total_preds[i].h;
     }
+  }
+}
+
+
+
+BMCpuOp::BMCpuOp(tpu::GenericCpuOp &op): op_(op) {
+  this->op_name = op.getCpuOpName().str();
+  this->op_type = this->getCpuOpType();
+  this->getCpuParam();
+}
+
+int BMCpuOp::getCpuOpType() {
+  return StringSwitch<int>(op_.getCpuOpName())
+      .Case("topk", CPU_TOPK)
+      .Default(CPU_LAYER_UNKNOW);
+}
+
+void BMCpuOp::get_topk_param() {
+  cpu_topk_param_t cpu_param{};
+  mlir::DictionaryAttr paramDic = op_.getParam().value();
+  cpu_param.k = paramDic.get("K").cast<IntegerAttr>().getInt();
+  cpu_param.axis = paramDic.get("axis").cast<IntegerAttr>().getInt();
+  cpu_param.sorted = paramDic.get("sorted").cast<BoolAttr>().getValue();
+  cpu_param.descending = paramDic.get("largest").cast<BoolAttr>().getValue();
+  this->param_size = sizeof (cpu_topk_param_t);
+  this->param = (void *)&cpu_param;
+}
+
+
+void BMCpuOp::getCpuParam() {
+  switch (this->op_type) {
+  case CPU_TOPK:
+    get_topk_param();
+    break ;
+  case CPU_LAYER_UNKNOW:
+    llvm_unreachable("wrong cpu layer type");
+  }
+}
+
+
+InstanceNormFunc::InstanceNormFunc(InstanceNormParam &param) : param_(param) {}
+
+void InstanceNormFunc::invoke() {
+  assert(param_.inputs.size() >= 2);
+  int n = param_.output.shape[0];
+  int c = param_.output.shape[1];
+  int h = param_.output.shape.size() > 2 ? param_.output.shape[2] : 1;
+  int w = param_.output.shape.size() > 3 ? param_.output.shape[3] : 1;
+
+  // gamma_value * (x - mean_value) / np.sqrt(var_value + epsilon) + beta_value
+  // epsilon default is 1e-5
+  // please reference onnx
+  // [implementation](https://github.com/onnx/onnx/blob/master/docs/Operators.md#InstanceNormalization)
+  // caffe2 cpu
+  // [implementation](https://caffe2.ai/doxygen-c/html/instance__norm__op_8cc_source.html)
+
+  std::vector<float> _mean(c);
+  std::vector<float> _variance(c);
+  int hw = h * w;
+
+  for (int ni = 0; ni < n; ++ni) {
+    for (int ci = 0; ci < c; ++ci) {
+      int channel_shift = ni * c * h * w + ci * h * w;
+      auto start = param_.inputs[0].ptr + channel_shift;
+      _mean[ci] = std::accumulate(start, start + hw, 0.0) / hw;
+
+      float var = 0;
+
+      for (int i = 0; i < hw; ++i) {
+        var += pow(param_.inputs[0].ptr[ni * c * h * w + ci * h * w + i] -
+                       _mean[ci],
+                   2);
+      }
+      var = (var) / hw;
+      _variance[ci] = var;
+    }
+  }
+
+  auto mean = &_mean;
+  auto variance = &_variance;
+
+  // duplicate code from bn
+  float scale_factor = 1 / param_.inputs[1].ptr[0];
+  for (int i = 0; i < c; ++i) {
+    mean->at(i) = mean->at(i) * scale_factor;
+    variance->at(i) = variance->at(i) * scale_factor;
+  }
+  for (int ni = 0; ni < n; ++ni) {
+    for (int ci = 0; ci < c; ++ci) {
+      for (int i = 0; i < h * w; ++i) {
+        auto x = param_.inputs[0].ptr[ni * c * h * w + ci * h * w + i] -
+                 mean->at(ci);
+        auto d = sqrt(variance->at(ci) + param_.eps);
+        param_.output.ptr[ni * c * h * w + ci * h * w + i] = x / d;
+        if (fabs(variance->at(ci)) <= param_.eps &&
+            fabs(mean->at(ci)) <= 1e-8 &&
+            fabs(param_.inputs[0].ptr[ni * c * h * w + ci * h * w + i]) >=
+                1.0e-4 &&
+            fabs(param_.output.ptr[ni * c * h * w + ci * h * w + i]) >=
+                1.0e-2) {
+          llvm::errs()
+              << "WARNING: BN: var too small, i=" << i
+              << ", v=" << std::to_string(variance->at(ci))
+              << ", m=" << std::to_string(mean->at(ci)) << "\n               "
+              << ", i="
+              << std::to_string(
+                     param_.inputs[0].ptr[ni * c * h * w + ci * h * w + i])
+              << ", x=" << std::to_string(x) << ", d=" << std::to_string(d)
+              << ", o="
+              << std::to_string(
+                     param_.output.ptr[ni * c * h * w + ci * h * w + i])
+              << "\n";
+        }
+      }
+    }
+  }
+  for (int i = 0; i < c; ++i) {
+    mean->at(i) = mean->at(i) * param_.inputs[1].ptr[0];
+    variance->at(i) = variance->at(i) * param_.inputs[1].ptr[0];
+  }
+}
+
+static void my_interp(const int channels, const float *data1, const int x1,
+                      const int y1, const int height1, const int width1,
+                      const int Height1, const int Width1, float *data2,
+                      const int x2, const int y2, const int height2,
+                      const int width2, const int Height2, const int Width2) {
+  bool packed = false;
+
+  assert(x1 >= 0 && y1 >= 0 && height1 > 0 && width1 > 0 && x2 >= 0 &&
+         y2 >= 0 && height2 > 0 && width2 > 0);
+  assert(Width1 >= width1 + x1 && Height1 >= height1 + y1 &&
+         Width2 >= width2 + x2 && Height2 >= height2 + y2);
+
+  // special case: just copy
+  if (height1 == height2 && width1 == width2) {
+    for (int h2 = 0; h2 < height2; ++h2) {
+      const int h1 = h2;
+      for (int w2 = 0; w2 < width2; ++w2) {
+        const int w1 = w2;
+        if (packed) {
+          const float *pos1 =
+              &data1[channels * ((y1 + h1) * Width1 + (x1 + w1))];
+          float *pos2 = &data2[channels * ((y2 + h2) * Width2 + (x2 + w2))];
+          for (int c = 0; c < channels; ++c) {
+            pos2[0] = pos1[0];
+            pos1++;
+            pos2++;
+          }
+        } else {
+          const float *pos1 = &data1[(y1 + h1) * Width1 + (x1 + w1)];
+          float *pos2 = &data2[(y2 + h2) * Width2 + (x2 + w2)];
+          for (int c = 0; c < channels; ++c) {
+            pos2[0] = pos1[0];
+            pos1 += Width1 * Height1;
+            pos2 += Width2 * Height2;
+          }
+        }
+      }
+    }
+    return;
+  }
+  const float rheight =
+      (height2 > 1) ? static_cast<float>(height1 - 1) / (height2 - 1) : 0.f;
+  const float rwidth =
+      (width2 > 1) ? static_cast<float>(width1 - 1) / (width2 - 1) : 0.f;
+  for (int h2 = 0; h2 < height2; ++h2) {
+    const float h1r = rheight * h2;
+    const int h1 = h1r;
+    const int h1p = (h1 < height1 - 1) ? 1 : 0;
+    const float h1lambda = h1r - h1;
+    const float h0lambda = float(1.) - h1lambda;
+    for (int w2 = 0; w2 < width2; ++w2) {
+      const float w1r = rwidth * w2;
+      const int w1 = w1r;
+      const int w1p = (w1 < width1 - 1) ? 1 : 0;
+      const float w1lambda = w1r - w1;
+      const float w0lambda = float(1.) - w1lambda;
+      if (packed) {
+        const float *pos1 = &data1[channels * ((y1 + h1) * Width1 + (x1 + w1))];
+        float *pos2 = &data2[channels * ((y2 + h2) * Width2 + (x2 + w2))];
+        for (int c = 0; c < channels; ++c) {
+          pos2[0] =
+              h0lambda *
+                  (w0lambda * pos1[0] + w1lambda * pos1[channels * w1p]) +
+              h1lambda * (w0lambda * pos1[channels * h1p * Width1] +
+                          w1lambda * pos1[channels * (h1p * Width1 + w1p)]);
+          pos1++;
+          pos2++;
+        }
+      } else {
+        const float *pos1 = &data1[(y1 + h1) * Width1 + (x1 + w1)];
+        float *pos2 = &data2[(y2 + h2) * Width2 + (x2 + w2)];
+        for (int c = 0; c < channels; ++c) {
+          pos2[0] = h0lambda * (w0lambda * pos1[0] + w1lambda * pos1[w1p]) +
+                    h1lambda * (w0lambda * pos1[h1p * Width1] +
+                                w1lambda * pos1[h1p * Width1 + w1p]);
+          pos1 += Width1 * Height1;
+          pos2 += Width2 * Height2;
+        }
+      }
+    }
+  }
+}
+
+static float coordinate_transform(float x_resized, float x_scale,
+                                  float length_resized, bool pytorch) {
+  // please refer NativeCpuImplementation.cpp for more details
+  if (pytorch) {
+    return length_resized > 1 ? ((x_resized + 0.5f) / x_scale - 0.5f) : 0.0f;
+  } else {
+    return (x_resized + 0.5f) / x_scale - 0.5f;
+  }
+}
+
+// copy from caffe_cpu_interp2
+static void interp(const int channels, const float *data1, const int x1,
+                   const int y1, const int height1, const int width1,
+                   const int Height1, const int Width1, float *data2,
+                   const int x2, const int y2, const int height2,
+                   const int width2, const int Height2, const int Width2) {
+  bool packed = false;
+
+  assert(x1 >= 0 && y1 >= 0 && height1 > 0 && width1 > 0 && x2 >= 0 &&
+         y2 >= 0 && height2 > 0 && width2 > 0);
+  assert(Width1 >= width1 + x1 && Height1 >= height1 + y1 &&
+         Width2 >= width2 + x2 && Height2 >= height2 + y2);
+
+  // special case: just copy
+  if (height1 == height2 && width1 == width2) {
+    for (int h2 = 0; h2 < height2; ++h2) {
+      const int h1 = h2;
+      for (int w2 = 0; w2 < width2; ++w2) {
+        const int w1 = w2;
+        if (packed) {
+          const float *pos1 =
+              &data1[channels * ((y1 + h1) * Width1 + (x1 + w1))];
+          float *pos2 = &data2[channels * ((y2 + h2) * Width2 + (x2 + w2))];
+          for (int c = 0; c < channels; ++c) {
+            pos2[0] = pos1[0];
+            pos1++;
+            pos2++;
+          }
+        } else {
+          const float *pos1 = &data1[(y1 + h1) * Width1 + (x1 + w1)];
+          float *pos2 = &data2[(y2 + h2) * Width2 + (x2 + w2)];
+          for (int c = 0; c < channels; ++c) {
+            pos2[0] = pos1[0];
+            pos1 += Width1 * Height1;
+            pos2 += Width2 * Height2;
+          }
+        }
+      }
+    }
+    return;
+  }
+  const float rheight =
+      (height2 > 1) ? static_cast<float>(height1 - 1) / (height2 - 1) : 0.f;
+  const float rwidth =
+      (width2 > 1) ? static_cast<float>(width1 - 1) / (width2 - 1) : 0.f;
+  for (int h2 = 0; h2 < height2; ++h2) {
+    const float h1r = rheight * h2;
+    const int h1 = h1r;
+    const int h1p = (h1 < height1 - 1) ? 1 : 0;
+    const float h1lambda = h1r - h1;
+    const float h0lambda = float(1.) - h1lambda;
+    for (int w2 = 0; w2 < width2; ++w2) {
+      const float w1r = rwidth * w2;
+      const int w1 = w1r;
+      const int w1p = (w1 < width1 - 1) ? 1 : 0;
+      const float w1lambda = w1r - w1;
+      const float w0lambda = float(1.) - w1lambda;
+      if (packed) {
+        const float *pos1 = &data1[channels * ((y1 + h1) * Width1 + (x1 + w1))];
+        float *pos2 = &data2[channels * ((y2 + h2) * Width2 + (x2 + w2))];
+        for (int c = 0; c < channels; ++c) {
+          pos2[0] =
+              h0lambda *
+                  (w0lambda * pos1[0] + w1lambda * pos1[channels * w1p]) +
+              h1lambda * (w0lambda * pos1[channels * h1p * Width1] +
+                          w1lambda * pos1[channels * (h1p * Width1 + w1p)]);
+          pos1++;
+          pos2++;
+        }
+      } else {
+        const float *pos1 = &data1[(y1 + h1) * Width1 + (x1 + w1)];
+        float *pos2 = &data2[(y2 + h2) * Width2 + (x2 + w2)];
+        for (int c = 0; c < channels; ++c) {
+          pos2[0] = h0lambda * (w0lambda * pos1[0] + w1lambda * pos1[w1p]) +
+                    h1lambda * (w0lambda * pos1[h1p * Width1] +
+                                w1lambda * pos1[h1p * Width1 + w1p]);
+          pos1 += Width1 * Height1;
+          pos2 += Width2 * Height2;
+        }
+      }
+    }
+  }
+}
+
+template <typename T>
+static void upsampleBilinear(int64_t batch_size, int64_t num_channels,
+                             int64_t input_height, int64_t input_width,
+                             float height_scale, float width_scale,
+                             const T *Xdata, T *Ydata, bool pytorch = false) {
+  int64_t output_width = static_cast<int64_t>(input_width * width_scale);
+  int64_t output_height = static_cast<int64_t>(input_height * height_scale);
+
+  for (int64_t n = 0; n < batch_size; ++n) {
+    for (int64_t c = 0; c < num_channels; ++c) {
+      for (int64_t y = 0; y < output_height; ++y) {
+        float in_y =
+            std::min(y / height_scale, static_cast<float>(input_height - 1));
+        in_y = height_scale == 1
+                   ? static_cast<float>(y)
+                   : coordinate_transform(static_cast<float>(y), height_scale,
+                                          static_cast<float>(output_height),
+                                          pytorch);
+        in_y = std::max(0.0f,
+                        std::min(in_y, static_cast<float>(input_height - 1)));
+
+        const int64_t in_y1 =
+            std::min(static_cast<int64_t>(in_y), input_height - 1);
+        const int64_t in_y2 = std::min(in_y1 + 1, input_height - 1);
+        float dy1 = fabs(in_y - in_y1);
+        float dy2 = fabs(in_y - in_y2);
+        if (in_y1 == in_y2) {
+          dy1 = 0.5f;
+          dy2 = 0.5f;
+        }
+
+        const int64_t input_width_mul_y1 = input_width * in_y1;
+        const int64_t input_width_mul_y2 = input_width * in_y2;
+
+        for (int64_t x = 0; x < output_width; ++x) {
+          float in_x =
+              std::min(x / width_scale, static_cast<float>(input_width - 1));
+          in_x = width_scale == 1
+                     ? static_cast<float>(x)
+                     : coordinate_transform(static_cast<float>(x), width_scale,
+                                            static_cast<float>(output_width),
+                                            pytorch);
+          in_x = std::max(0.0f,
+                          std::min(in_x, static_cast<float>(input_width - 1)));
+
+          const int64_t in_x1 =
+              std::min(static_cast<int64_t>(in_x), input_width - 1);
+          const int64_t in_x2 = std::min(in_x1 + 1, input_width - 1);
+
+          float dx1 = std::abs(in_x - in_x1);
+          float dx2 = std::abs(in_x - in_x2);
+          if (in_x1 == in_x2) {
+            dx1 = 0.5f;
+            dx2 = 0.5f;
+          }
+
+          T X11 = Xdata[input_width_mul_y1 + in_x1];
+          T X21 = Xdata[input_width_mul_y1 + in_x2];
+          T X12 = Xdata[input_width_mul_y2 + in_x1];
+          T X22 = Xdata[input_width_mul_y2 + in_x2];
+
+          Ydata[output_width * y + x] =
+              static_cast<T>(dx2 * dy2 * X11 + dx1 * dy2 * X21 +
+                             dx2 * dy1 * X12 + dx1 * dy1 * X22);
+        }
+      }
+      Xdata += input_height * input_width;
+      Ydata += output_width * output_height;
+    }
+  }
+}
+
+static void interp_linear(float *input, float *output, int n, int c, int ih,
+                          int iw, int oh, int ow, bool pytorch = false) {
+  float height_scale = (float)oh / (float)ih;
+  float width_scale = (float)ow / (float)iw;
+  upsampleBilinear<float>(n, c, ih, iw, height_scale, width_scale, input,
+                          output, pytorch);
+}
+
+static void interp_neast(float *input, float *output, int n, int c, int ih,
+                         int iw, int oh, int ow, bool half_pixel) {
+  int nc = n * c;
+  float scale_h = ((float)ih) / oh;
+  float scale_w = ((float)iw) / ow;
+#pragma omp parallel for schedule(static, omp_schedule(nc))
+  for (int i = 0; i < nc; i++) {
+    for (int h = 0; h < oh; h++) {
+      for (int w = 0; w < ow; w++) {
+        int o_index = i * oh * ow + h * ow + w;
+        int h_resized = (int)(half_pixel ? std::ceil((h + 0.5) * scale_h - 1.0)
+                                         : h * scale_h);
+        int w_resized = (int)(half_pixel ? std::ceil((w + 0.5) * scale_w - 1.0)
+                                         : w * scale_w);
+        int i_index = i * ih * iw + h_resized * iw + w_resized;
+        output[o_index] = input[i_index];
+      }
+    }
+  }
+}
+
+static inline float value(float *input, int w, int ih, int iw) {
+  return input[ih * w + iw];
+}
+
+static float value(float *input, int w, float fh, float fw) {
+  int h0 = std::floor(fh);
+  int h1 = std::ceil(fh);
+  int w0 = std::floor(fw);
+  int w1 = std::ceil(fw);
+  if (h0 == fh && w0 == fw) {
+    return value(input, w, h0, w0);
+  }
+  if (h0 == fh) {
+    return value(input, w, h0, w0) * (w1 - fw) +
+           value(input, w, h0, w1) * (fw - w0);
+  }
+  if (w0 == fw) {
+    return value(input, w, h0, w0) * (h1 - fh) +
+           value(input, w, h1, w0) * (fh - h0);
+  }
+  float scale0 = (w1 - fw) * (h1 - fh);
+  float scale1 = (fw - w0) * (h1 - fh);
+  float scale2 = (w1 - fw) * (fh - h0);
+  float scale3 = (fw - w0) * (fh - h0);
+  return value(input, w, h0, w0) * scale0 + value(input, w, h0, w1) * scale1 +
+         value(input, w, h1, w0) * scale2 + value(input, w, h1, w1) * scale3;
+}
+
+static void interp_asymmetric(float *input, float *output, int n, int c, int ih,
+                              int iw, int oh, int ow) {
+  int nc = n * c;
+  float scale_h = (float)ih / oh;
+  float scale_w = (float)iw / ow;
+#pragma omp parallel for schedule(static, omp_schedule(nc))
+  for (int i = 0; i < nc; i++) {
+    for (int h = 0; h < oh; h++) {
+      for (int w = 0; w < ow; w++) {
+        int o_index = i * oh * ow + h * ow + w;
+        float fh = std::min(h * scale_h, (float)(ih - 1));
+        float fw = std::min(w * scale_w, (float)(iw - 1));
+        output[o_index] = value(input + i * ih * iw, iw, fh, fw);
+      }
+    }
+  }
+}
+
+InterpFunc::InterpFunc(InterpParam &param) : param_(param) {}
+
+void InterpFunc::invoke() {
+  auto &input_shape = param_.inputs[0].shape;
+  auto &output_shape = param_.output.shape;
+  int in = input_shape[0];
+  int ic = input_shape[1];
+  int ih = input_shape[2];
+  int iw = input_shape[3];
+  int oh = output_shape[2];
+  int ow = output_shape[3];
+  int height_in_ = ih;
+  int width_in_ = iw;
+  int height_in_eff_ = height_in_ + param_.pad_beg + param_.pad_end;
+  int width_in_eff_ = width_in_ + param_.pad_beg + param_.pad_end;
+  int height_out_ = -1;
+  int width_out_ = -1;
+  if (param_.shrink_factor && !param_.zoom_factor) {
+    assert(param_.shrink_factor >= 1 && "Shrink factor must be positive");
+    height_out_ = (height_in_eff_ - 1) / param_.shrink_factor + 1;
+    width_out_ = (width_in_eff_ - 1) / param_.shrink_factor + 1;
+  } else if (param_.zoom_factor && !param_.shrink_factor) {
+    assert(param_.zoom_factor >= 1 && "Zoom factor must be positive");
+    height_out_ =
+        height_in_eff_ + (height_in_eff_ - 1) * (param_.zoom_factor - 1);
+    width_out_ = width_in_eff_ + (width_in_eff_ - 1) * (param_.zoom_factor - 1);
+  } else if (param_.height && param_.width) {
+    height_out_ = param_.height;
+    width_out_ = param_.width;
+  } else if (param_.zoom_factor && param_.shrink_factor) {
+    assert(param_.shrink_factor >= 1 && "Shrink factor must be positive");
+    assert(param_.zoom_factor >= 1 && "Zoom factor must be positive");
+
+    height_out_ = (height_in_eff_ - 1) / param_.shrink_factor + 1;
+    width_out_ = (width_in_eff_ - 1) / param_.shrink_factor + 1;
+    height_out_ = height_out_ + (height_out_ - 1) * (param_.zoom_factor - 1);
+    width_out_ = width_out_ + (width_out_ - 1) * (param_.zoom_factor - 1);
+  }
+  if (param_.coordinate_transformation_mode == "align_corners") {
+    // TODO: verify pad_end_ > 0
+    my_interp(in * ic, param_.inputs[0].ptr, -param_.pad_beg, -param_.pad_beg,
+              height_in_eff_, width_in_eff_, height_in_, width_in_,
+              param_.output.ptr, 0, 0, height_out_, width_out_, height_out_,
+              width_out_);
+  } else if (param_.coordinate_transformation_mode == "half_pixel") {
+    interp_linear(param_.inputs[0].ptr, param_.output.ptr, in, ic, ih, iw, oh,
+                  ow);
+  } else if (param_.coordinate_transformation_mode == "pytorch_half_pixel") {
+    interp_linear(param_.inputs[0].ptr, param_.output.ptr, in, ic, ih, iw, oh,
+                  ow, true);
+  } else if (param_.coordinate_transformation_mode == "nearest_half_pixel") {
+    interp_neast(param_.inputs[0].ptr, param_.output.ptr, in, ic, ih, iw, oh,
+                 ow, true);
+  } else if (param_.coordinate_transformation_mode == "nearest") {
+    interp_neast(param_.inputs[0].ptr, param_.output.ptr, in, ic, ih, iw, oh,
+                 ow, false);
+  } else if (param_.coordinate_transformation_mode == "asymmetric") {
+    interp_asymmetric(param_.inputs[0].ptr, param_.output.ptr, in, ic, ih, iw,
+                      oh, ow);
+  } else {
+    llvm_unreachable("coordinate_transformation_model not support");
+  }
+}
+
+EmbeddingFunc::EmbeddingFunc(EmbeddingParam &param) : param_(param) {}
+
+void EmbeddingFunc::invoke() {
+  auto &input_shape = param_.inputs[0].shape;
+  auto &table_shape = param_.inputs[1].shape;
+  auto &output_shape = param_.output.shape;
+  auto input_data = param_.inputs[0].ptr;
+  auto table_data = param_.inputs[1].ptr;
+  auto output_data = param_.output.ptr;
+
+  auto feature_dim = table_shape.back();
+  assert(output_shape.back() == feature_dim && "must be the same feature dim");
+  int64_t count = std::accumulate(input_shape.begin(), input_shape.end(), 1,
+                                  std::multiplies<int64_t>());
+  for (int64_t i = 0; i < count; i++) {
+    auto index = (size_t)input_data[i];
+    size_t table_offset = (size_t)index * feature_dim;
+    auto out_offset = i * feature_dim;
+    memcpy(output_data + out_offset, table_data + table_offset,
+           feature_dim * sizeof(float));
+    // if (mix_bf16 == false) {
+    //   memcpy(output_data + out_offset, table_data + table_offset,
+    //         feature_dim * sizeof(float));
+    // } else {
+    //   for (int64_t j = 0; j < feature_dim; j++) {
+    //     output[out_offset + j] =
+    //         BF16(BF16(table[table_offset + j] * scale_data->at(j)) +
+    //         zeropoint_data->at(j));
+    //   }
+    // }
   }
 }
 

@@ -33,14 +33,10 @@ def DynGlobalGenInterface : OpInterface<"DynGlobalGenInterface"> {
         /*args=*/(ins "void *":$buffer)
       >,
       InterfaceMethod<
-        /*desc=*/[{}],
+        /*desc=*/"Return the layer type.",
         /*retType=*/"int64_t",
-        /*methodName=*/"dyn_codegen_global_cv18xx",
-        /*args=*/(ins "void *":$buffer),
-        /*methodBody=*/"",
-        /*defaultImplementation=*/[{
-          return 0;
-        }]
+        /*methodName=*/"get_fw_type_bm1684x",
+        /*args=*/(ins)
       >,
   ];
 }

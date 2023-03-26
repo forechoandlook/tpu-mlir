@@ -50,7 +50,7 @@ getQuantInt8TypeNewShape(Value v, std::vector<int64_t> new_shape,
 
 void SoftmaxLowering::LoweringF32(PatternRewriter &rewriter,
                                   top::SoftmaxOp op) const {
-  lowering_common_f32<tpu::SoftmaxOp>(rewriter, op, 5);
+  lowering_common_f32<tpu::SoftmaxOp>(rewriter, op, 6);
 }
 void SoftmaxLowering::LoweringINT4(PatternRewriter &rewriter, top::SoftmaxOp op,
                                    bool asymmetric) const {
@@ -96,7 +96,7 @@ void SoftmaxLowering::LoweringINT8(PatternRewriter &rewriter, top::SoftmaxOp op,
   for (auto &attr : op->getAttrs()) {
     if (attr.getName() == "axis" && op.getAxis() != 1) {
       attrs.push_back(
-          rewriter.getNamedAttr("axis", rewriter.getI64IntegerAttr(1)));
+          rewriter.getNamedAttr("axis", rewriter.getSI32IntegerAttr(1)));
     } else
       attrs.push_back(attr);
   }
@@ -117,6 +117,7 @@ void SoftmaxLowering::LoweringINT8(PatternRewriter &rewriter, top::SoftmaxOp op,
           ValueRange{in_reshaped, table_opd,
                      module::getNoneOp(op.getOperation()),
                      module::getNoneOp(op.getOperation()),
+                     module::getNoneOp(op.getOperation()),
                      module::getNoneOp(op.getOperation())},
           attrs);
 
@@ -127,6 +128,7 @@ void SoftmaxLowering::LoweringINT8(PatternRewriter &rewriter, top::SoftmaxOp op,
       rewriter.replaceOpWithNewOp<tpu::SoftmaxOp>(
           op, out_type,
           ValueRange{op.getInput(), table_opd,
+                     module::getNoneOp(op.getOperation()),
                      module::getNoneOp(op.getOperation()),
                      module::getNoneOp(op.getOperation()),
                      module::getNoneOp(op.getOperation())},
@@ -153,6 +155,7 @@ void SoftmaxLowering::LoweringINT8(PatternRewriter &rewriter, top::SoftmaxOp op,
       auto newOp = rewriter.create<tpu::SoftmaxOp>(
           sftmax_name_loc, sft_out_type,
           ValueRange{trans_in_op, table_opd,
+                     module::getNoneOp(op.getOperation()),
                      module::getNoneOp(op.getOperation()),
                      module::getNoneOp(op.getOperation()),
                      module::getNoneOp(op.getOperation())},
@@ -228,7 +231,7 @@ void SoftmaxLowering::LoweringQuantized(PatternRewriter &rewriter,
   for (auto &attr : op->getAttrs()) {
     if (attr.getName() == "axis" && op.getAxis() != 1) {
       attrs.push_back(
-          rewriter.getNamedAttr("axis", rewriter.getI64IntegerAttr(1)));
+          rewriter.getNamedAttr("axis", rewriter.getSI32IntegerAttr(1)));
     } else
       attrs.push_back(attr);
   }
@@ -236,6 +239,7 @@ void SoftmaxLowering::LoweringQuantized(PatternRewriter &rewriter,
     rewriter.replaceOpWithNewOp<tpu::SoftmaxOp>(
         op, op.getOutput().getType(),
         ValueRange{op.getInput(), table_opd,
+                   module::getNoneOp(op.getOperation()),
                    module::getNoneOp(op.getOperation()),
                    module::getNoneOp(op.getOperation()),
                    module::getNoneOp(op.getOperation())},
@@ -257,6 +261,7 @@ void SoftmaxLowering::LoweringQuantized(PatternRewriter &rewriter,
     auto newOp = rewriter.create<tpu::SoftmaxOp>(
         name_loc, newType,
         ValueRange{TransOp, table_opd, module::getNoneOp(op.getOperation()),
+                   module::getNoneOp(op.getOperation()),
                    module::getNoneOp(op.getOperation()),
                    module::getNoneOp(op.getOperation())},
         attrs);

@@ -14,7 +14,7 @@
 
 int64_t top::AddOp::getFLOPs() {
   return module::getNumElements(getOutput()) *
-         (getInputs().size() - 1 + getDoRelu() ? 1 : 0);
+         (getInputs().size() - 1 + (getDoRelu() ? 1 : 0));
 }
 
 LogicalResult top::AddOp::init(InferenceParameter &p) {
@@ -70,4 +70,8 @@ LogicalResult top::AddOp::inference(InferenceParameter &p) {
   }
 
   return success();
+}
+
+void top::AddOp::shape_inference() {
+  broadcast_shape_inference(getOperation());
 }

@@ -41,9 +41,6 @@ deconv_attr_t tpu::DeconvOp::parseParam() {
   auto dilation = module::getI64Array(getDilations(), 2, 1);
   p.dh = dilation->at(0);
   p.dw = dilation->at(1);
-  auto ins = module::getI64Array(getInserts(), 2, 0);
-  p.ins_h = ins->at(0);
-  p.ins_w = ins->at(1);
   p.g = getGroup();
   p.do_relu = getDoRelu();
   p.relu_limit = getReluLimit().convertToDouble();
@@ -89,6 +86,10 @@ LogicalResult tpu::DeconvOp::inference(InferenceParameter &p) {
     }
   } else if (module::isUniformQuantized(getOutput())) {
     auto qmode = getQuantMode();
+    bool is_tf = qmode == tpu::RequantMode::QDM ||
+                 qmode == tpu::RequantMode::TFLite ||
+                 qmode == tpu::RequantMode::TFLite_LShift;
+    auto rmode = is_tf ? ROUNDING_HALF_AWAY_FROM_ZERO : ROUNDING_HALF_UP;
     // apply multiplier && rshift inplace
     int64_t n, c, h, w;
     module::getNCHW(getOutput(), n, c, h, w);
@@ -104,7 +105,7 @@ LogicalResult tpu::DeconvOp::inference(InferenceParameter &p) {
           int offset = (on * c + oc) * h * w + hw;
           int64_t v = 0;
           v = applyMultiplierAndRShift(p.outputs[0][offset], multi, shift,
-                                       qmode);
+                                       qmode, rmode);
           p.outputs[0][offset] = to_int8(v);
         }
       }
@@ -122,9 +123,8 @@ tpu_mlir::DeconvSlice(int64_t out_idx, int64_t out_slice, int64_t stride,
   float max_real_in_idx = ih - 1;
   int pad_th = filter - pad - 1;
   int in_idx = out_idx;
-  float real_in_idx = (in_idx - pad_th <= 0)
-                          ? 0
-                          : std::ceil((float)(in_idx - pad_th) / stride);
+  float real_in_idx =
+      (in_idx - pad_th <= 0) ? 0 : std::ceil((float)(in_idx - pad_th) / stride);
 
   int in_end_idx = out_idx + out_slice + filter - 2;
   float real_in_end_idx =
@@ -145,7 +145,8 @@ LogicalResult tpu::DeconvOp::BackwardH(int64_t &in_idx, int64_t &in_slice,
                                        int64_t out_idx, int64_t out_slice) {
   auto &attr = getDeconvParam(*this);
   int kh_ext = (attr.kh - 1) * attr.dh + 1;
-  if (auto ret = DeconvSlice(out_idx, out_slice, attr.sh, kh_ext, attr.ih, attr.pad_h)) {
+  if (auto ret = DeconvSlice(out_idx, out_slice, attr.sh, kh_ext, attr.ih,
+                             attr.pad_h)) {
     in_idx = ret.value()[2];
     in_slice = ret.value()[3];
   } else {

@@ -41,7 +41,7 @@ static void dot(std::vector<float> &lhs, std::vector<float> &rhs,
                 std::vector<float> &rst) {
   size_t lhs_size = lhs.size();
   size_t rhs_size = rhs.size();
-  rst.resize(lhs_size & rhs_size);
+  rst.resize(lhs_size * rhs_size);
   for (auto i = 0; i < rhs_size; ++i) {
     for (auto j = 0; j < lhs_size; ++j) {
       rst[j * rhs_size + i] = lhs[j] * rhs[i];
@@ -74,10 +74,10 @@ static void resize_to_conv1(PatternRewriter &rewriter, top::InterpOp &op,
   pad_attrs.emplace_back(
       rewriter.getNamedAttr("mode", rewriter.getI64IntegerAttr(mode)));
   auto input_type = op.getInput().getType().cast<RankedTensorType>();
-  auto pad_type = RankedTensorType::get(shape_after_pad,
-                                        op.getInput().getType().getElementType());
-  auto pad_op = rewriter.create<top::PadOp>(loc, pad_type,
-                                            ValueRange{op.getInput()}, pad_attrs);
+  auto pad_type = RankedTensorType::get(
+      shape_after_pad, op.getInput().getType().getElementType());
+  auto pad_op = rewriter.create<top::PadOp>(
+      loc, pad_type, ValueRange{op.getInput()}, pad_attrs);
 
   // insert conv op
   int64_t ic = shape_after_pad[1];
@@ -108,7 +108,8 @@ static void resize_to_conv1(PatternRewriter &rewriter, top::InterpOp &op,
   std::vector<int64_t> weight_shape = {ic, 1, 1, conv_kernel_shape[0],
                                        conv_kernel_shape[1]};
   auto weight_type = RankedTensorType::get(weight_shape, rewriter.getF32Type());
-  std::string weight_name = module::getName(op.getInput()).str() + "_add_weight";
+  std::string weight_name =
+      module::getName(op.getInput()).str() + "_add_weight";
   auto weight_operand =
       top::WeightOp::create(op, weight_name, weight, weight_type);
 
@@ -154,7 +155,8 @@ static void resize_to_conv2(PatternRewriter &rewriter, top::InterpOp &op,
   std::vector<int64_t> weight_shape = {ic, 1, 1, conv_kernel_shape[0],
                                        conv_kernel_shape[1]};
   auto weight_type = RankedTensorType::get(weight_shape, rewriter.getF32Type());
-  std::string weight_name = module::getName(op.getInput()).str() + "_conv_filter";
+  std::string weight_name =
+      module::getName(op.getInput()).str() + "_conv_filter";
   auto weight_operand =
       top::WeightOp::create(op, weight_name, weight, weight_type);
 
@@ -178,16 +180,16 @@ static void resize_to_conv2(PatternRewriter &rewriter, top::InterpOp &op,
 }
 
 static void getInterpHWScale(int64_t oh, int64_t ow, int64_t ih, int64_t iw,
-                             double &rheight, double &rwidth) {
+                             float &rheight, float &rwidth) {
   if (oh == 1) {
     rheight = ih;
   } else {
-    rheight = static_cast<double>(ih - 1) / (oh - 1);
+    rheight = static_cast<float>(ih - 1) / (oh - 1);
   }
   if (ow == 1) {
     rwidth = iw;
   } else {
-    rwidth = static_cast<double>(iw - 1) / (ow - 1);
+    rwidth = static_cast<float>(iw - 1) / (ow - 1);
   }
 }
 
@@ -257,12 +259,82 @@ static bool resize_to_conv_deconv(PatternRewriter &rewriter, top::InterpOp &op,
                                   int64_t in, int64_t ic, int64_t ih,
                                   int64_t iw, int64_t on, int64_t oc,
                                   int64_t oh, int64_t ow) {
+  bool is_shrink = true;
+  float shrink_factor = 0.0f;
+  if (oh > ih && ow > iw) {
+    is_shrink = false;
+  } else if (oh < ih && ow < iw) {
+    float h_factor = static_cast<float>(ih - 1) / (oh - 1);
+    float w_factor = static_cast<float>(iw - 1) / (ow - 1);
+    if (std::abs(h_factor - w_factor) > 1e-5) {
+      llvm::errs() << "resize convert not support ih/iw:" << ih << "/" << iw
+                   << ", oh/ow:" << oh << "/" << ow;
+      return false;
+    }
+    shrink_factor = h_factor;
+  } else {
+    llvm::errs() << "resize convert not support ih/iw:" << ih << "/" << iw
+                 << ", oh/ow:" << oh << "/" << ow;
+    return false;
+  }
+
+  if (is_shrink) {
+    if (std::abs(std::ceil(shrink_factor) - std::floor(shrink_factor)) < 1e-5) {
+      int64_t factor = shrink_factor;
+      // replace with conv
+      int filter_size = factor * factor;
+      float filter_val = 1; // nearnest
+      std::vector<int64_t> filter_shape = {ic, 1, factor,
+                                           factor};
+      std::vector<float> new_filter(filter_size * ic, 0);
+      for (int i = 0; i < ic; ++i) {
+        new_filter[i * filter_size] = filter_val; // nearest
+      }
+      // insert conv op
+      std::vector<int64_t> conv_strides = {factor,
+                                           factor};
+      std::vector<int64_t> conv_pads = {0, 0, 1, 1};
+      std::vector<int64_t> conv_kernel_shape = {
+          factor,
+          factor};
+      int64_t group = ic;
+      // create conv kernel (weight)
+      // weight_shape = [ic, 1, 1, kh, kw]
+      auto weight_type =
+          RankedTensorType::get(filter_shape, rewriter.getF32Type());
+      std::string weight_name =
+          module::getName(op.getInput()).str() + "_conv_weight";
+      auto weight_operand =
+          top::WeightOp::create(op, weight_name, new_filter, weight_type);
+
+      // create conv op
+      std::vector<Value> operands;
+      operands.emplace_back(op.getInput());
+      operands.emplace_back(weight_operand);
+      operands.emplace_back(module::getNoneOp(op));
+      std::vector<NamedAttribute> conv_attrs;
+      conv_attrs.emplace_back(rewriter.getNamedAttr(
+          "kernel_shape", rewriter.getI64ArrayAttr(conv_kernel_shape)));
+      conv_attrs.emplace_back(rewriter.getNamedAttr(
+          "strides", rewriter.getI64ArrayAttr(conv_strides)));
+      conv_attrs.emplace_back(
+          rewriter.getNamedAttr("pads", rewriter.getI64ArrayAttr(conv_pads)));
+      conv_attrs.emplace_back(
+          rewriter.getNamedAttr("group", rewriter.getI64IntegerAttr(group)));
+      rewriter.replaceOpWithNewOp<top::ConvOp>(op, op.getType(), operands,
+                                               conv_attrs);
+      return true;
+    }
+    return false;
+  }
+
+  float rwidth = 0.0f;
+  float rheight = 0.0f;
+  int rwidthInt = 0;
+  int rheightInt = 0;
+
   int kh = -1;
   int kw = -1;
-  double rwidth = 0.0;
-  double rheight = 0.0;
-  int64_t rwidthInt = 0;
-  int64_t rheightInt = 0;
 
   // keep Dividend / Divisor for later non-divisable
   std::vector<std::pair<int, int>> maxInsertWAtOnce;
@@ -372,6 +444,9 @@ static bool resize_to_conv_deconv(PatternRewriter &rewriter, top::InterpOp &op,
                                                  attrs);
     return true;
   }
+  // TODO support
+  // not support in tpu-mlir:convert in top2tpu will cause less of threshold when convert one op to multiply ops.
+  return false;
 
   // check for hw spec, ins/stride range is 0-15 in 1835
   for (auto h_ins_stride : maxInsertHAtOnce) {
@@ -548,7 +623,7 @@ static bool resize_to_conv_deconv(PatternRewriter &rewriter, top::InterpOp &op,
     // prepare filter
     auto filter_type =
         RankedTensorType::get(filter_shape, rewriter.getF32Type());
-    std::string filter_name = module::getName(op.getInput()).str() + "_filter";
+    std::string filter_name = std::to_string(d) + "_filter";
     auto weight_operand =
         top::WeightOp::create(op, filter_name, filter, filter_type);
 
@@ -645,6 +720,7 @@ static bool resize_to_conv_deconv(PatternRewriter &rewriter, top::InterpOp &op,
     kernel[1] = kw;
     std::vector<NamedAttribute> attrs = createConvAttr(
         kernel, stride, dilation, padding, g, is_dw, with_bias, ins);
+
 
     if (loop - 1 == d) {
       // last one replace the interp name for compare
@@ -747,36 +823,31 @@ static void LoweringInterp(PatternRewriter &rewriter, top::InterpOp op,
   assert(o_shape.size() >= 2);
   switch (coord_mode.value()) {
   case tpu::ResizeCoordMode::half_pixel:
-    if (mode.value() == tpu::ResizeMode::nearest) {
-      coordinate_transformation_mode = "nearest_half_pixel";
-    } else {
-      coordinate_transformation_mode = "half_pixel";
-    }
+    coordinate_transformation_mode = "half_pixel";
     break;
   case tpu::ResizeCoordMode::align_corners:
     coordinate_transformation_mode = "align_corners";
     break;
   case tpu::ResizeCoordMode::pytorch_half_pixel:
-    if (mode.value() == tpu::ResizeMode::linear &&
-        o_shape[o_shape.size() - 1] > 1 && o_shape[o_shape.size() - 2] > 1) {
-      coordinate_transformation_mode = "half_pixel";
-    } else {
-      coordinate_transformation_mode = "pytorch_half_pixel";
-    }
+    coordinate_transformation_mode = "pytorch_half_pixel";
     break;
   default:
     llvm_unreachable("Unsupport interp coord type \n");
   }
 
-  // convert interp to conv/deconv ...
   double scale_h = op.getScaleH().convertToDouble();
   double scale_w = op.getScaleW().convertToDouble();
   if (mode.value() == tpu::ResizeMode::linear) {
+    if (o_shape[o_shape.size() - 1] > 1 && o_shape[o_shape.size() - 2] > 1 &&
+        coordinate_transformation_mode == "pytorch_half_pixel") {
+      coordinate_transformation_mode = "half_pixel";
+    }
+    // convert interp to conv/deconv ...
     if (coordinate_transformation_mode == "half_pixel") {
       if (std::ceil(scale_h) == std::floor(scale_h) &&
           std::ceil(scale_w) == std::floor(scale_w)) {
         // todo only support ins == 0
-        // return resize_to_conv1(rewriter, op, scale_h, scale_w);
+        return resize_to_conv1(rewriter, op, scale_h, scale_w);
       }
       if (std::abs(scale_h - scale_w) < 1e-6 &&
           std::abs(scale_h - 0.5) < 1e-6) {
@@ -786,34 +857,29 @@ static void LoweringInterp(PatternRewriter &rewriter, top::InterpOp op,
   } else if (mode.value() == tpu::ResizeMode::nearest) {
     if (std::ceil(scale_h) == std::floor(scale_h) &&
         std::ceil(scale_w) == std::floor(scale_w)) {
-      //assert(0 && "already converted in onnx_convert\n");
-      // from caffe
+      assert(0 && "already converted in onnx_convert\n");
+      //  from caffe
     }
+    coordinate_transformation_mode = "nearest_half_pixel";
   } else {
     llvm_unreachable("Unsupport interp mode type \n");
   }
+
   int64_t on, oc, oh, ow;
   int64_t in, ic, ih, iw;
   module::getNCHW(o_shape, on, oc, oh, ow);
   module::getNCHW(i_shape, in, ic, ih, iw);
-  bool is_shrink = true;
-  if (oh > ih && ow > iw) {
-    is_shrink = false;
-  }
-#if 0
-  // TODO support
-  if (!is_shrink) {
+  if (coordinate_transformation_mode == "align_corners") {
     if (resize_to_conv_deconv(rewriter, op, in, ic, ih, iw, on, oc, oh, ow)) {
       return;
     }
   }
-#endif
 
   // lowering to cpu op
   std::vector<NamedAttribute> attrs;
   std::vector<NamedAttribute> param;
-  attrs.emplace_back(rewriter.getNamedAttr("cpu_op_name",
-                                           rewriter.getStringAttr("interp")));
+  attrs.emplace_back(
+      rewriter.getNamedAttr("cpu_op_name", rewriter.getStringAttr("interp")));
   param.emplace_back(rewriter.getNamedAttr(
       "width", rewriter.getI32IntegerAttr(o_shape[o_shape.size() - 1])));
   param.emplace_back(rewriter.getNamedAttr(

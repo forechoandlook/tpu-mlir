@@ -16,7 +16,7 @@
 
 int64_t top::MulOp::getFLOPs() {
   return module::getNumElements(getOutput()) *
-         (getInputs().size() - 1 + getDoRelu() ? 1 : 0);
+         (getInputs().size() - 1 + (getDoRelu() ? 1 : 0));
 }
 
 LogicalResult top::MulOp::init(InferenceParameter &p) {
@@ -51,4 +51,8 @@ LogicalResult top::MulOp::inference(InferenceParameter &p) {
   auto binary = (Binary *)p.handle;
   binary->run();
   return success();
+}
+
+void top::MulOp::shape_inference() {
+  broadcast_shape_inference(getOperation());
 }

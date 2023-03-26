@@ -56,6 +56,11 @@ public:
         if (in2.getDefiningOp() == nullptr || in2.hasOneUse() == false) {
           return failure();
         }
+      } else if (auto rshape = dyn_cast<tpu::SqueezeOp>(in_op)) {
+        auto in2 = rshape.getInputs();
+        if (in2.getDefiningOp() == nullptr || in2.hasOneUse() == false) {
+          return failure();
+        }
       } else if (auto sliceOp = dyn_cast<tpu::SliceOp>(in_op)) {
         auto p = sliceOp.parseParam();
         if (p.fusible) {
@@ -79,7 +84,7 @@ public:
     module::removeUnusedOp();
     if (module::isCV18xx()) {
       CVAddressAssign addr_assign;
-      addr_assign.assign(mOp, reuse_addr);
+      addr_assign.assign(mOp, reuse_addr, merge_weight, compress_weight, weight_map_file);
     } else {
       RewritePatternSet patterns(mOp.getContext());
       bm168x::populateGlobalBufferPatterns(&patterns);

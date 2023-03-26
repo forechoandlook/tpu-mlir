@@ -24,10 +24,11 @@ def Module_State: I32EnumAttr<"State", "module state",[
       I32EnumAttrCase<"TOP_F32", 0>,
       I32EnumAttrCase<"TOP_CALIBRATED", 1>,
       I32EnumAttrCase<"TOP_QUANTIZED", 2>,
-      I32EnumAttrCase<"TPU_LOWERED",3>,
-      I32EnumAttrCase<"TPU_REORDERED",4>,
-      I32EnumAttrCase<"TPU_DIVIDED",5>,
-      I32EnumAttrCase<"TPU_ADDRESSED",6>
+      I32EnumAttrCase<"TPU_LOWERED", 3>,
+      I32EnumAttrCase<"TPU_REORDERED", 4>,
+      I32EnumAttrCase<"TPU_DIVIDED", 5>,
+      I32EnumAttrCase<"TPU_ADDRESSED", 6>,
+      I32EnumAttrCase<"TOSA_F32", 7>
     ]> {
   let genSpecializedAttr = 0;
   let cppNamespace = "::tpu_mlir::module";
@@ -54,6 +55,17 @@ def Module_Mode: I32EnumAttr<"Mode", "module mode",[
       I32EnumAttrCase<"BF16",  3>,
       I32EnumAttrCase<"F16",   4>,
       I32EnumAttrCase<"F32",   5>
+    ]> {
+  let genSpecializedAttr = 0;
+  let cppNamespace = "::tpu_mlir::module";
+}
+
+def Module_Platform: I32EnumAttr<"Platform", "module platform",[
+      I32EnumAttrCase<"ONNX",    0>,
+      I32EnumAttrCase<"TORCH",   1>,
+      I32EnumAttrCase<"TFLITE",  2>,
+      I32EnumAttrCase<"CAFFE",   3>,
+      I32EnumAttrCase<"TPULANG", 4>,
     ]> {
   let genSpecializedAttr = 0;
   let cppNamespace = "::tpu_mlir::module";
